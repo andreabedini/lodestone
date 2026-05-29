@@ -97,7 +97,7 @@ playit-agent-proto = {package = "playit-agent-proto", git = "https://github.com/
 hex = "0.4.3"
 toml = "0.7.4"
 which = "5.0.0"
-bollard = "*"
+bollard = "0.15"
 [dependencies.uuid]
 version = "1.1.2"
 features = [

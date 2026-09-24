@@ -30,6 +30,13 @@ npm run dev                         # next dev on :3001
 npm run build                       # next build && next export
 ```
 
+**End-to-end:** `core/tests/e2e.sh` (zsh, ~35 s, needs network) builds nothing; it runs
+`target/debug/lodestone_core` on a throwaway data dir, creates and starts a real vanilla
+server, runs a test macro and the `auto-backup` example, then tears down. In the Claude
+sandbox each Bash command has its own network namespace, so the server and the client must
+run in one command (the script does); declare the Mojang, Adoptium, GitHub and deno.land
+hosts for that command.
+
 `.env` holds `DATABASE_URL=sqlite://dev.db` (sqlx). Primary instance state lives as
 JSON files in instance dirs (`.lodestone_config`); the SQLite DB stores only the
 event log.

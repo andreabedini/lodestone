@@ -34,25 +34,32 @@ npm run build                       # next build && next export
 JSON files in instance dirs (`.lodestone_config`); the SQLite DB stores only the
 event log.
 
-## ⚠️ The toolchain is pinned by the Deno/V8 stack — read before upgrading
+## ⚠️ The Deno/V8 stack is old — read before upgrading
 
-`rust-toolchain.toml` pins **Rust 1.70.0**. This is **not arbitrary**: the vendored
-`v8 0.73` / `deno_core 0.190` (2023) fail to compile on any modern rustc with
-`E0080: size_of::<TypeId>() == size_of::<u64>()` (verified broken on 1.93 and 1.96).
+`rust-toolchain.toml` pins **Rust 1.96.0**. The old Deno stack (`deno_core 0.190`,
+`deno_runtime 0.116`, `v8 0.73`, 2023) only builds on it because of a local patch:
 
-**Consequences — do not fight these blindly:**
+- **`vendor/v8/`** is the published `v8 0.73.0` crate (only `Cargo.toml`, `build.rs`,
+  `src/`, `tools/download_file.py`), wired in via `[patch.crates-io]` in the root
+  `Cargo.toml`. The upstream crate asserts `size_of::<TypeId>() == size_of::<u64>()`,
+  which fails with `E0080` on rustc ≥ 1.72 (TypeId is 128-bit). The fix is in
+  `TypeIdHasher` in `vendor/v8/src/isolate.rs`, marked `LODESTONE PATCH`. The build
+  still downloads the prebuilt `librusty_v8` 0.73.0 from GitHub release assets
+  (`github.com` + `release-assets.githubusercontent.com`).
+- Remove `vendor/v8` and the patch once the Deno stack is upgraded to a `deno_core`
+  that pulls `v8 ≥ 0.74` (which handles 128-bit TypeId upstream).
 
-1. **Do not bump `rust-toolchain.toml`** without first upgrading the whole Deno stack
-   (`deno_core`, `deno_runtime`, `deno_ast`, which pull a newer `v8`). That is a real
-   project, not a one-liner.
-2. **Dependency upgrades are MSRV-constrained.** Many patched crate versions now
-   require rustc ≥1.80/1.81 and therefore **will not build on 1.70**. Known walls:
-   - `time ≥0.3.36` pulls `deranged` (needs rustc 1.81) — stay on `time 0.3.20`.
-   - `openssl ≥0.10.76` / `openssl-sys ≥0.9.112` need rustc 1.80 — the last
-     1.70-compatible patched pair is **`openssl 0.10.75` + `openssl-sys 0.9.111`**.
-   When `cargo update -p X` breaks the build with "requires rustc 1.8x", find the
-   newest version that still declares MSRV 1.70 (check the registry index's
-   `rust_version` field) and pin it with `cargo update -p X --precise <ver>`.
+**Known dependency walls (held by the old Deno/swc crates, not by rustc):**
+
+- `serde` must stay old: `serde 1.0.229` (which splits out `serde_core`) breaks the old
+  `swc_common` with `unresolved import serde::__private`. `1.0.193` is known good.
+  Because `time ≥ 0.3.46` requires the newer serde, **`time` is capped at 0.3.44**
+  (so RUSTSEC-2026-0009, fixed in 0.3.47, stays open until the Deno upgrade).
+- Plain `cargo update` / `cargo update -p X` may pull the newer serde now that
+  `rust-version` is 1.96. After any update, check `Cargo.lock` still has
+  `serde 1.0.193` and run `cargo check`; pin with `cargo update -p X --precise <ver>`.
+- Do not bump `rust-toolchain.toml` further without re-running the full test suite:
+  `vendor/v8` is only verified on 1.96.0 (and `cargo check` on 1.98.1).
 
 ## Sandbox / environment notes
 

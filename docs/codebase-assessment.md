@@ -14,7 +14,7 @@
 | **Frontend** | Next.js 13 + React 18 + TypeScript (~235 TS/TSX files in `dashboard/src`), Tauri 1.4 desktop wrapper |
 | **Notable subsystems** | Embedded **Deno runtime** for user "macros", SQLite event log (forked sqlx), Docker via `bollard`, playit.gg tunneling, UPnP |
 | **Last upstream commit** | **2024-09-09** |
-| **Toolchain pin** | **Rust 1.70.0** (June 2023). The Deno/V8 stack prevents moving off it; see §7.1 |
+| **Toolchain pin** | **Rust 1.96.0**, made possible by a one-function patch to the vendored `v8 0.73` crate (`vendor/v8`); see §7.1 |
 | **Tests** | ~44 backend unit tests, **0 frontend tests**, no integration tests |
 | **Dependency health** | Several git forks. Most dependencies are about 2 years behind. Latest audit: 25 RustSec vulnerabilities and 314 npm advisories (§7) |
 
@@ -47,7 +47,7 @@ The `monitor` handler at `core/src/handlers/monitor.rs:23` serves the route `/mo
 
 ### 🟠 S4 — Stale dependency tree
 
-The project is pinned to Rust 1.70, axum 0.6 and `rand 0.6.5` (from 2019). It also uses an old `deno_core`/`deno_runtime` and several unmaintained crates (`ansi_term`, `tempdir`). The May 2026 quick wins cleared the openssl, bytes, h2, mio, tar and whoami advisories, and pinned `bollard` to 0.15. A real `cargo audit` run (§7.2) still reports **25 vulnerabilities** in the workspace, and most of them are reachable from `lodestone_core`. Most of the remaining fixes are blocked behind the Deno, axum and sqlx-fork upgrades.
+The project was pinned to Rust 1.70 until 2026-09-24 (now 1.96, §7.1). It still uses axum 0.6 and `rand 0.6.5` (from 2019). It also uses an old `deno_core`/`deno_runtime` and several unmaintained crates (`ansi_term`, `tempdir`). The May 2026 quick wins cleared the openssl, bytes, h2, mio, tar and whoami advisories, and pinned `bollard` to 0.15. A real `cargo audit` run (§7.2) still reports **25 vulnerabilities** in the workspace, and most of them are reachable from `lodestone_core`. Most of the remaining fixes are blocked behind the Deno, axum and sqlx-fork upgrades.
 
 ### 🟡 S5 — CORS `allow_origin(Any)`
 
@@ -86,7 +86,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 
 ### Phase 0 — Stabilize & measure
 
-1. ~~**Green build on a modern toolchain.**~~ **Not possible without the Deno upgrade** (§7.1). Stay on 1.70 until Phase 3.
+1. ✅ **Green build on a modern toolchain** — done 2026-09-24 on Rust 1.96.0 by patching `v8 0.73` locally instead of upgrading Deno (§7.1).
 2. ✅ **Run `cargo audit`** — done 2026-09-24 (§7.2). Still to do: install `cargo audit` + `cargo deny` as CI gates.
 3. ✅ **Pin `bollard`** to 0.15 (was `*`). Still to do: inventory the git-forked dependencies, recording *why* each was forked and whether upstream now covers it.
 4. ✅ **`npm audit`** on the dashboard — done 2026-09-24 (§7.3).
@@ -107,14 +107,14 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 
 ### Phase 3 — Dependency modernization
 
-13. **Upgrade the Deno stack** (`deno_core` / `deno_runtime` / `deno_ast`, which bring a newer `v8`). This is the key that unlocks everything else: it lifts the Rust 1.70 pin, clears the `deno_crypto` advisories (rsa, ring, aes-gcm, curve25519-dalek) and makes S1 easier to harden.
-14. Once off 1.70, upgrade in dependency order: `axum 0.6 → 0.7+` (router and extractor API changes; brings hyper 1 / h2 0.4 and a fixed tungstenite), Next.js 13 → 14/15, React Query 4 → 5, and Tauri 1.4 → 2.x if the desktop app is ever used.
+13. **Upgrade the Deno stack** (`deno_core` / `deno_runtime` / `deno_ast`, which bring a newer `v8`). It is no longer needed for the toolchain (§7.1), but it still clears the `deno_crypto` advisories (rsa, ring, aes-gcm, curve25519-dalek) and makes S1 easier to harden. It also lifts the old-`serde` cap (which holds `time` below its RUSTSEC-2026-0009 fix) and lets `vendor/v8` be deleted.
+14. Upgrade in dependency order (no longer blocked by the toolchain): `axum 0.6 → 0.7+` (router and extractor API changes; brings hyper 1 / h2 0.4 and a fixed tungstenite), Next.js 13 → 14/15, React Query 4 → 5, and Tauri 1.4 → 2.x if the desktop app is ever used.
 15. **Retire the sqlx fork**: move to upstream modern sqlx and a real migration setup (`sqlx migrate`).
 16. Resolve the dual `playit-agent` dependency to a single version.
 
 ### Ongoing hygiene
 
-- Dependabot or Renovate on both `Cargo.toml` and `package.json`, constrained to MSRV 1.70 until Phase 3.
+- Dependabot or Renovate on both `Cargo.toml` and `package.json`, with `serde` held at 1.0.193 until the Deno upgrade (§7.1).
 - CI gates: `cargo audit`, `cargo deny`, `cargo clippy -D warnings`, `npm audit`, plus the new test suites.
 - A documented release and versioning process (currently 0.5.1, with no changelog).
 
@@ -136,7 +136,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 **Longer-term / strategic**
 
 - **Fork strategy:** settled as a hard fork (personal use). Upstream or eliminate each forked dependency over time.
-- Re-evaluate the embedded Deno runtime against a lighter sandbox (e.g. WASM) if macro security proves hard to bound. Weigh this against the cost of the Deno upgrade in Phase 3: dropping or replacing Deno would also remove the toolchain pin.
+- Re-evaluate the embedded Deno runtime against a lighter sandbox (e.g. WASM) if macro security proves hard to bound. Weigh this against the cost of the Deno upgrade in Phase 3: dropping or replacing Deno would also remove the `vendor/v8` patch and the `serde` cap.
 
 > [!NOTE]
 > See also the *Kubernetes Instance Backend Feasibility* note (in the personal notes vault, not in this repository). It is a code-grounded look at running each instance as a Kubernetes pod, and is the strictly larger version of the "finish the Docker instance integration" item above. Both need the same `ServerBackend`/`ConsoleTransport` extraction. That work is currently **shelved**.
@@ -151,26 +151,31 @@ Nothing is on fire *right now*, as long as the instance isn't exposed to the int
 
 The codebase is well-structured enough to be worth maintaining. The limiting factor is the **absence of tests** (A1), which is why Phase 2 must come before any serious upgrade work.
 
-**Suggested next actions:** the remaining 1.70-compatible quick wins (§7.4), then S3/S7/S5.
+**Suggested next actions:** the remaining quick wins (§7.4), then S3/S7/S5.
 
 ---
 
 ## 7. Toolchain and dependency audit
 
-### 7.1 Toolchain — the pin is held by `v8`
+### 7.1 Toolchain — unblocked by patching `v8`
 
 Verified with `cargo +<ver> check -p lodestone_core --locked --keep-going` (latest run 2026-09-24):
 
 | Toolchain | Result | Blocker(s) |
 |-----------|--------|-----------|
-| 1.70.0 (current pin) | ✅ builds | — |
-| **1.93** | ❌ fails | `v8 0.73` — `E0080: assertion failed: size_of::<TypeId>() == size_of::<u64>()` **and** `time 0.3.20` — `E0282` |
-| **1.96.0** | ❌ fails | same two errors |
+| 1.70.0 (old pin) | ✅ builds | — |
+| 1.93 / 1.96.0, unpatched | ❌ fails | `v8 0.73` — `E0080: assertion failed: size_of::<TypeId>() == size_of::<u64>()` **and** `time 0.3.20` — `E0282` |
+| **1.96.0 (current pin)**, patched | ✅ builds, tests pass | — (121/124 tests pass; the 3 failures are PaperMC's live API changing shape, unrelated) |
+| 1.98.1, patched | ✅ `cargo check` | not pinned: not installed via rustup here |
 
 > [!IMPORTANT]
-> The first version of this note (2026-05-29) said `v8` compiled on 1.93 and that `cargo update -p time` would unblock Rust 1.93. **That is wrong:** `v8` fails on 1.93 too, and `time ≥ 0.3.36` itself needs rustc 1.81 (via `deranged`). The toolchain is pinned by the embedded **Deno/V8 stack**, not by Lodestone's own code. There is no cheap intermediate step: moving off 1.70 requires the Deno upgrade (Phase 3, item 13).
+> Earlier versions of this note said moving off 1.70 required the Deno upgrade. **It does not.** The only `v8` breakage is one compile-time assertion in `TypeIdHasher` (`src/isolate.rs`), since `TypeId` became 128-bit in Rust 1.72. The fix (2026-09-24):
+>
+> - `vendor/v8/` holds the published `v8 0.73.0` crate (`Cargo.toml`, `build.rs`, `src/`, `tools/download_file.py`), wired in with `[patch.crates-io]` in the root `Cargo.toml`. `TypeIdHasher` now folds any `write`/`write_u64` input instead of assuming exactly one 64-bit write; the size assertion is removed. It still links the same prebuilt `librusty_v8` 0.73.0 binary.
+> - `time 0.3.20 → 0.3.44` fixes the `E0282` inference error on rustc ≥ 1.80.
+> - Macro tests (`macro_executor::tests`, which execute JS in V8) pass on 1.96.0.
 
-Consequence: every dependency bump has to respect **MSRV 1.70**. See `CLAUDE.md` for the known limits and for how to pin the newest compatible version.
+New wall: the old `swc_common` (via `deno_ast`) breaks on `serde 1.0.229` (`unresolved import serde::__private`), so `serde` is held at **1.0.193**, which caps `time` at 0.3.44 (0.3.46+ needs the newer serde). See `CLAUDE.md`.
 
 ### 7.2 Rust dependencies — `cargo audit` (2026-09-24)
 
@@ -191,7 +196,7 @@ Consequence: every dependency bump has to respect **MSRV 1.70**. See `CLAUDE.md`
 | webpki | 0.22.0 | RUSTSEC-2023-0052 | CPU DoS in path building | ≥ 0.22.2 | via rustls 0.20 |
 | tungstenite | 0.18.0 | RUSTSEC-2023-0065 | Remote DoS | ≥ 0.20.1 | `axum 0.6` → axum upgrade |
 | h2 | 0.3.27 | RUSTSEC-2026-0258 | Unbounded empty DATA frames | ≥ 0.4.16 | hyper 0.14 → axum upgrade |
-| time | 0.3.20 | RUSTSEC-2026-0009 | DoS via stack exhaustion | ≥ 0.3.47 | needs rustc ≥ 1.81 → Deno upgrade |
+| time | 0.3.44 | RUSTSEC-2026-0009 | DoS via stack exhaustion | ≥ 0.3.47 | needs newer `serde`, which breaks old `swc_common` → Deno upgrade |
 | time | 0.1.45 | RUSTSEC-2020-0071 | Potential segfault (`localtime_r`) | ≥ 0.2.23 | `chrono 0.4.22` (direct), `playit-agent` |
 | tracing-subscriber | 0.3.16 | RUSTSEC-2025-0055 | ANSI-escape log injection | ≥ 0.3.20 | **quick win** (0.3.20 declares MSRV 1.65) |
 | remove_dir_all | 0.5.3 | RUSTSEC-2023-0018 | TOCTOU link-following race | ≥ 0.8.0 | only via `tempdir` → **quick win** (§7.4) |
@@ -214,9 +219,9 @@ Consequence: every dependency bump has to respect **MSRV 1.70**. See `CLAUDE.md`
 
 The runtime-relevant direct dependencies to look at first are **`axios`** (critical) and **`jsonwebtoken`** (high). After those, `react-router-dom`, `formik` and `yup`. The rest clears with the Next.js 13 → 14/15 and Storybook upgrades in Phase 3.
 
-### 7.4 Remaining quick wins (compatible with Rust 1.70)
+### 7.4 Remaining quick wins
 
-Each item has to be verified with `cargo check` / `cargo test` on 1.70 after the bump. A declared MSRV does not cover transitive dependencies.
+Each item has to be verified with `cargo check` / `cargo test` after the bump, and `Cargo.lock` must still have `serde 1.0.193` (§7.1). With the toolchain at 1.96, MSRV is no longer the constraint; `openssl` can also move past 0.10.75 now.
 
 1. `cargo update -p tracing-subscriber --precise 0.3.20` (or the newest version that still builds): clears RUSTSEC-2025-0055.
 2. Replace the test-only `tempdir::TempDir::new(..)` calls (`util.rs`, `global_settings.rs`, `auth/user.rs`) with `tempfile::tempdir()`. `tempfile` is already a dependency. Then drop `tempdir`, which removes `remove_dir_all 0.5.3` along with it.
@@ -225,7 +230,7 @@ Each item has to be verified with `cargo check` / `cargo test` on 1.70 after the
 5. Replace `ansi_term` (two call sites in `lib.rs`) with a maintained crate or plain ANSI codes.
 6. Dashboard: bump `axios` and `jsonwebtoken` within their current majors where possible.
 
-Beyond this list, the remaining advisories are gated on three larger projects: the **Deno stack** (Rust toolchain, `time`, `deno_crypto` chain), the **axum 0.7 migration** (h2, tungstenite, rustls 0.20 via axum-server) and **retiring the sqlx fork**.
+Beyond this list, the remaining advisories are gated on three larger projects: the **Deno stack** (`serde`/`time`, `deno_crypto` chain), the **axum 0.7 migration** (h2, tungstenite, rustls 0.20 via axum-server) and **retiring the sqlx fork**.
 
 ---
 

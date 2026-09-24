@@ -23,8 +23,3 @@ license = "APGL-3.0"
 authors = ["Lodestone Team"]
 rust-version = "1.96"
 
-# v8 0.73 (pulled in by deno_core 0.190) asserts `TypeId` is 64 bits, which is
-# false since Rust 1.72. vendor/v8 is the published crate with that hasher
-# fixed; it still downloads the same prebuilt librusty_v8 0.73.0.
-[patch.crates-io]
-v8 = { path = "vendor/v8" }

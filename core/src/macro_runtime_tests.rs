@@ -24,7 +24,7 @@ use crate::events::{
 };
 use crate::implementations::generic::GenericInstance;
 use crate::macro_executor::{
-    DefaultWorkerOptionGenerator, MacroExecutor, MacroPID, SpawnResult, WorkerOptionGenerator,
+    DefaultExtensionGenerator, ExtensionGenerator, MacroExecutor, MacroPID, SpawnResult,
 };
 use crate::prelude::{GameInstance, VERSION};
 use crate::traits::t_configurable::GameType;
@@ -96,6 +96,8 @@ struct RunOptions {
     feed: Vec<Event>,
     /// Abort the macro once it emits a detach event.
     abort_on_detach: bool,
+    /// The directory the macro can access through the `Deno.*` fs API.
+    fs_root: Option<PathBuf>,
 }
 
 struct RunResult {
@@ -146,7 +148,7 @@ impl Harness {
     async fn run_in(&self, dir: &Path, source: &str, options: RunOptions) -> RunResult {
         let path = dir.join("main.ts");
         std::fs::write(&path, format!("{JS_ASSERT}\n{source}")).unwrap();
-        self.run_file(path, Box::new(DefaultWorkerOptionGenerator), options)
+        self.run_file(path, Box::new(DefaultExtensionGenerator), options)
             .await
     }
 
@@ -161,7 +163,7 @@ impl Harness {
     async fn run_file(
         &self,
         path: PathBuf,
-        generator: Box<dyn WorkerOptionGenerator>,
+        generator: Box<dyn ExtensionGenerator>,
         options: RunOptions,
     ) -> RunResult {
         // subscribe before spawning so that no event is missed
@@ -175,6 +177,7 @@ impl Harness {
                 generator,
                 options.pre_injection_code,
                 options.instance_uuid,
+                options.fs_root,
             )
             .await
             .expect("failed to spawn macro");
@@ -558,6 +561,7 @@ fn fake_atom_source() -> String {
             doubleReadyRejected: false,
             lastCommand: null,
             calls: [],
+            cwd: Deno.cwd(),
         }};
 
         ops.proc_bridge_ready();
@@ -1019,5 +1023,291 @@ async fn macro_lib_uses_embedded_glue() {
             RunOptions::default(),
         )
         .await;
+    result.assert_success();
+}
+
+// ---------------------------------------------------------------------------
+// `Deno` namespace, fs permissions, fetch
+
+/// An instance directory with a small world, and a sibling directory the
+/// macro must not reach (directly, via `..`, or via the `escape-link`
+/// symlink inside the instance directory).
+fn fs_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let base = tempfile::TempDir::new().unwrap();
+    let root = base.path().join("instance");
+    let outside = base.path().join("outside");
+    std::fs::create_dir_all(root.join("world/region")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("world/level.dat"), "level data").unwrap();
+    std::fs::write(root.join("world/region/r.0.0.mca"), "region data").unwrap();
+    std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("escape-link")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let outside = outside.canonicalize().unwrap();
+    (base, root, outside)
+}
+
+/// The fs API works inside the root, with relative paths resolved against it,
+/// and the std `fs/copy.ts` (what the auto-backup example uses) works.
+/// Needs network access to deno.land.
+#[tokio::test]
+async fn fs_inside_the_instance_directory() {
+    let harness = Harness::new();
+    let (_base, root, _outside) = fs_fixture();
+    let source = format!(
+        r#"
+        import {{ copy }} from "https://deno.land/std@0.191.0/fs/copy.ts";
+        assertEq(Deno.cwd(), {root}, "Deno.cwd() is the instance directory");
+        assertEq(await Deno.readTextFile("world/level.dat"), "level data", "relative read");
+        assertEq(Deno.readTextFileSync({root} + "/world/level.dat"), "level data", "absolute read");
+        await Deno.writeTextFile("notes.txt", "hi");
+        assertEq(Deno.statSync("notes.txt").size, 2, "write + stat");
+        await Deno.mkdir("a/b", {{ recursive: true }});
+        await Deno.remove("a", {{ recursive: true }});
+        let e = null;
+        try {{ await Deno.readTextFile("does-not-exist"); }} catch (err) {{ e = err; }}
+        assert(e instanceof Deno.errors.NotFound, "missing file is NotFound: " + e);
+        e = null;
+        try {{ await Deno.mkdir("world"); }} catch (err) {{ e = err; }}
+        assert(e instanceof Deno.errors.AlreadyExists, "existing dir is AlreadyExists: " + e);
+
+        await copy("world", "backups/world");
+        const names = [];
+        for await (const entry of Deno.readDir("backups/world")) names.push(entry.name);
+        assertEq(names.sort(), ["level.dat", "region"], "copied tree");
+        "#,
+        root = serde_json::to_string(&root.to_string_lossy()).unwrap(),
+    );
+    harness
+        .run_in(
+            &root,
+            &source,
+            RunOptions {
+                fs_root: Some(root.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .assert_success();
+    assert_eq!(
+        std::fs::read_to_string(root.join("backups/world/region/r.0.0.mca")).unwrap(),
+        "region data"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "hi"
+    );
+}
+
+/// Every way out of the instance directory is denied with an error that is
+/// `instanceof Deno.errors.PermissionDenied`.
+#[tokio::test]
+async fn fs_outside_the_instance_directory_is_denied() {
+    let harness = Harness::new();
+    let (_base, root, outside) = fs_fixture();
+    let source = format!(
+        r#"
+        const root = {root};
+        const outside = {outside};
+        async function denied(what, f) {{
+            let e = null;
+            try {{
+                await f();
+            }} catch (err) {{
+                e = err;
+            }}
+            assert(e !== null, what + ": not denied");
+            assert(e instanceof Deno.errors.PermissionDenied, what + ": wrong error " + e);
+            assert(e instanceof Deno.errors.NotCapable, what + ": not NotCapable " + e);
+        }}
+        await denied("absolute read", () => Deno.readTextFile(outside + "/secret.txt"));
+        await denied("absolute sync read", () => Deno.readTextFileSync(outside + "/secret.txt"));
+        await denied("absolute write", () => Deno.writeTextFile(outside + "/pwned.txt", "x"));
+        await denied("relative ../", () => Deno.readTextFile("../outside/secret.txt"));
+        await denied("absolute root/..", () => Deno.readTextFile(root + "/world/../../outside/secret.txt"));
+        await denied("symlink read", () => Deno.readTextFile("escape-link/secret.txt"));
+        await denied("symlink write", () => Deno.writeTextFile("escape-link/pwned.txt", "x"));
+        await denied("readDir /", async () => {{ for await (const _ of Deno.readDir("/")) {{}} }});
+        await denied("/etc/hostname", () => Deno.readTextFile("/etc/hostname"));
+        await denied("copyFile out", () => Deno.copyFile("world/level.dat", outside + "/stolen"));
+        await denied("rename out", () => Deno.rename("world/level.dat", "../outside/stolen"));
+        "#,
+        root = serde_json::to_string(&root.to_string_lossy()).unwrap(),
+        outside = serde_json::to_string(&outside.to_string_lossy()).unwrap(),
+    );
+    harness
+        .run_in(
+            &root,
+            &source,
+            RunOptions {
+                fs_root: Some(root.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .assert_success();
+    let mut left: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, vec![std::ffi::OsString::from("secret.txt")]);
+    assert!(root.join("world/level.dat").exists());
+}
+
+/// A macro spawned without an fs root has no fs access at all.
+#[tokio::test]
+async fn fs_without_a_root_is_denied() {
+    let harness = Harness::new();
+    let dir = temp_dir();
+    std::fs::write(dir.join("data.txt"), "data").unwrap();
+    let source = format!(
+        r#"
+        for (const [what, f] of [
+            ["read", () => Deno.readTextFileSync({file})],
+            ["write", () => Deno.writeTextFileSync({file}, "x")],
+            ["cwd", () => Deno.cwd()],
+        ]) {{
+            let e = null;
+            try {{ f(); }} catch (err) {{ e = err; }}
+            assert(e instanceof Deno.errors.PermissionDenied, what + ": " + e);
+        }}
+        "#,
+        file = serde_json::to_string(&dir.join("data.txt").to_string_lossy()).unwrap(),
+    );
+    harness
+        .run_in(&dir, &source, RunOptions::default())
+        .await
+        .assert_success();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data.txt")).unwrap(),
+        "data"
+    );
+}
+
+/// What `Deno` exposes, and what it must not.
+#[tokio::test]
+async fn deno_namespace_is_restricted() {
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"
+            for (const name of ["run", "Command", "env", "exit", "core", "spawn", "spawnSync", "kill", "dlopen", "serve", "listen", "connect"]) {
+                assert(!(name in Deno), "Deno." + name + " must not exist");
+            }
+            assert(globalThis.__bootstrap === undefined, "__bootstrap is hidden");
+            assert(Object.isFrozen(Deno), "Deno is frozen");
+            assertEq(typeof Deno.build.os, "string", "Deno.build");
+            assertEq(typeof Deno.readTextFile, "function", "fs API");
+            assertEq(typeof Deno.inspect, "function", "Deno.inspect");
+            assert(typeof Deno.errors.PermissionDenied === "function", "Deno.errors");
+            // the compat table holds Lodestone's ops only
+            const ops = Object.keys(Deno[Deno.internal].core.ops);
+            assert(ops.includes("next_event") && ops.includes("start_instance"), "lodestone ops present");
+            assert(!ops.includes("lodestone_bootstrap_info"), "bootstrap op hidden");
+            assert(ops.every((name) => !name.startsWith("op_")), "no deno ops: " + ops.filter((n) => n.startsWith("op_")));
+            for (const g of ["fetch", "Request", "Response", "Headers", "URL", "TextEncoder", "AbortController", "structuredClone", "atob", "performance", "Blob", "File", "ReadableStream", "WritableStream", "TransformStream"]) {
+                assert(g in globalThis, g + " is a global");
+            }
+            const t = performance.now();
+            assert(typeof t === "number" && t >= 0 && t < 60000, "performance.now() is relative to the macro start: " + t);
+            assertEq(await new Blob(["ab", "c"]).text(), "abc", "Blob");
+            const reader = new ReadableStream({ start(c) { c.enqueue(1); c.close(); } }).getReader();
+            assertEq((await reader.read()).value, 1, "ReadableStream");
+            // the internal modules that hold the full op table are not importable
+            for (const specifier of ["ext:core/mod.js", "ext:core/ops", "ext:lodestone/bootstrap.js", "ext:deno_fs/30_fs.js"]) {
+                let imported = null;
+                try {
+                    imported = await import(specifier);
+                } catch (_) {
+                    // expected
+                }
+                assert(imported === null, specifier + " is importable");
+            }
+            "#,
+            RunOptions::default(),
+        )
+        .await;
+    result.assert_success();
+}
+
+/// `fetch` works (decision B). Needs network access to example.com.
+#[tokio::test]
+async fn fetch_works() {
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"
+            const res = await fetch("https://example.com/");
+            assertEq(res.status, 200, "status");
+            assert((await res.text()).includes("Example Domain"), "body");
+            "#,
+            RunOptions::default(),
+        )
+        .await;
+    result.assert_success();
+}
+
+/// JSON modules with the standard `with` syntax, from TS and from plain JS.
+#[tokio::test]
+async fn json_import_attributes() {
+    let harness = Harness::new();
+    let dir = temp_dir();
+    std::fs::write(dir.join("data.json"), r#"{ "answer": 42 }"#).unwrap();
+    std::fs::write(
+        dir.join("plain.js"),
+        "import data from \"./data.json\" with { type: \"json\" };\nexport const answer = data.answer;\n",
+    )
+    .unwrap();
+    harness
+        .run_in(
+            &dir,
+            r#"
+            import data from "./data.json" with { type: "json" };
+            import { answer } from "./plain.js";
+            assertEq(data.answer, 42, "TS import with `with`");
+            assertEq(answer, 42, "JS import with `with`");
+            "#,
+            RunOptions::default(),
+        )
+        .await
+        .assert_success();
+}
+
+/// The deprecated `assert` syntax is rejected in plain JS by V8 (TS files are
+/// transpiled, which rewrites it to `with`).
+#[tokio::test]
+async fn json_import_assert_in_plain_js_is_a_syntax_error() {
+    let harness = Harness::new();
+    let dir = temp_dir();
+    std::fs::write(dir.join("data.json"), r#"{ "answer": 42 }"#).unwrap();
+    std::fs::write(
+        dir.join("old.js"),
+        "import data from \"./data.json\" assert { type: \"json\" };\nexport default data;\n",
+    )
+    .unwrap();
+    let result = harness
+        .run_in(&dir, r#"import "./old.js";"#, RunOptions::default())
+        .await;
+    let error_msg = result.error_msg();
+    assert!(error_msg.contains("SyntaxError"), "{error_msg}");
+}
+
+/// A generic instance's code gets its instance directory as its fs root.
+#[tokio::test]
+async fn generic_instance_fs_root_is_the_instance_directory() {
+    let harness = Harness::new();
+    let (uuid, path, _instance) =
+        spawn_fake_generic_instance(&harness.executor, &harness.event_broadcaster).await;
+    let source = format!(
+        r#"
+        import * as IC from "{instance_control}";
+        assertEq(JSON.parse(await IC.getInstanceGameVersion("{uuid}")).cwd, {path}, "atom's Deno.cwd()");
+        "#,
+        instance_control = instance_control_ts(),
+        path = serde_json::to_string(&path.canonicalize().unwrap().to_string_lossy()).unwrap(),
+    );
+    let result = harness.run(&source, RunOptions::default()).await;
+    crate::init_test_app_state().await.instances.remove(&uuid);
     result.assert_success();
 }

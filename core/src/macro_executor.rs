@@ -1,7 +1,19 @@
+//! Runs macros: TypeScript/JavaScript on an embedded V8 (`deno_core`).
+//!
+//! Each macro gets its own OS thread, with its own current-thread tokio
+//! runtime and its own `JsRuntime`. The runtime has the web APIs from
+//! deno_web/deno_fetch, a small `Deno` namespace (fs scoped to the macro's
+//! root directory), and Lodestone's ops; see `macro_executor/bootstrap.js`.
+//!
+//! Ops that touch the app state or an instance run on Lodestone's shared
+//! runtime (see [`crate::deno_ops::run_on_shared`]).
+
 use std::{
     fmt::{Debug, Display},
     iter::zip,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    pin::Pin,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,70 +22,50 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{eyre, Context};
 use dashmap::DashMap;
-use deno_runtime::permissions::Permissions;
+use deno_core::{JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions};
 use futures_util::Future;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{sync::mpsc, task::LocalSet};
-use tracing::{debug, error, log::warn};
+use tokio::sync::{mpsc, Notify};
+use tracing::{debug, error, warn};
 use ts_rs::TS;
 
 use crate::{
-    deno_ops::{
-        events::register_all_event_ops, instance_control::register_instance_control_ops,
-        prelude::register_prelude_ops,
-    },
-    embedded_glue,
     error::{Error, ErrorKind},
     event_broadcaster::EventBroadcaster,
     events::{CausedBy, EventInner, MacroEvent, MacroEventInner},
+    prelude::VERSION,
+    traits::t_configurable::manifest::{ConfigurableValue, ConfigurableValueType, SettingManifest},
     traits::t_macro::ExitStatus,
     types::InstanceUuid,
+    util::fs,
 };
 
-use color_eyre::eyre::eyre;
+mod extension;
+mod loader;
+mod permissions;
 
-use std::pin::Pin;
+use loader::TypescriptModuleLoader;
 
-use anyhow::bail;
-use deno_ast::MediaType;
-use deno_ast::ParseParams;
-use deno_ast::SourceTextInfo;
-use deno_core::ModuleLoader;
-use deno_core::ModuleSource;
-use deno_core::ModuleSourceFuture;
-use deno_core::ModuleSpecifier;
-use deno_core::ModuleType;
-use deno_core::ResolutionKind;
-use deno_core::{anyhow, error::generic_error};
-use deno_core::{resolve_import, ModuleCode};
-
-use crate::traits::t_configurable::manifest::{
-    ConfigurableValue, ConfigurableValueType, SettingManifest,
-};
-use crate::util::fs;
-use futures::FutureExt;
-use indexmap::IndexMap;
-
-pub trait WorkerOptionGenerator: Send + Sync {
-    fn generate(&self) -> deno_runtime::worker::WorkerOptions;
+/// Extra extensions for a macro, on top of the standard `lodestone` one.
+///
+/// Their ops are exposed to the macro like Lodestone's own. Generic ("atom")
+/// instances use this for the procedure bridge.
+pub trait ExtensionGenerator: Send + Sync {
+    /// Called on the macro's thread (an `Extension` is not `Send`).
+    fn generate(&self) -> Vec<deno_core::Extension>;
 }
 
-pub struct DefaultWorkerOptionGenerator;
+/// No extra extensions.
+pub struct DefaultExtensionGenerator;
 
-impl WorkerOptionGenerator for DefaultWorkerOptionGenerator {
-    fn generate(&self) -> deno_runtime::worker::WorkerOptions {
-        deno_runtime::worker::WorkerOptions {
-            module_loader: Rc::new(TypescriptModuleLoader::default()),
-            ..Default::default()
-        }
+impl ExtensionGenerator for DefaultExtensionGenerator {
+    fn generate(&self) -> Vec<deno_core::Extension> {
+        Vec::new()
     }
-}
-
-pub struct TypescriptModuleLoader {
-    http: reqwest::Client,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, TS)]
@@ -105,133 +97,6 @@ impl Display for MacroPID {
     }
 }
 
-impl Default for TypescriptModuleLoader {
-    fn default() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
-    }
-}
-
-/// How a module of `media_type` is loaded: its module type, and whether it
-/// has to be transpiled first. `None` if it cannot be loaded.
-fn module_type_of(media_type: MediaType) -> Option<(ModuleType, bool)> {
-    match media_type {
-        MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-            Some((ModuleType::JavaScript, false))
-        }
-        MediaType::Jsx => Some((ModuleType::JavaScript, true)),
-        MediaType::TypeScript
-        | MediaType::Mts
-        | MediaType::Cts
-        | MediaType::Dts
-        | MediaType::Dmts
-        | MediaType::Dcts
-        | MediaType::Tsx => Some((ModuleType::JavaScript, true)),
-        MediaType::Json => Some((ModuleType::Json, false)),
-        _ => None,
-    }
-}
-
-impl ModuleLoader for TypescriptModuleLoader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        _kind: ResolutionKind,
-    ) -> Result<ModuleSpecifier, anyhow::Error> {
-        Ok(resolve_import(specifier, referrer)?)
-    }
-
-    fn load(
-        &self,
-        module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&ModuleSpecifier>,
-        _is_dyn_import: bool,
-    ) -> Pin<Box<ModuleSourceFuture>> {
-        let module_specifier = module_specifier.clone();
-        let http = self.http.clone();
-        async move {
-            let (code, module_type, media_type, should_transpile) = if let Some(path) =
-                embedded_glue::glue_path(module_specifier.as_str())
-            {
-                // Lodestone's own glue: serve the copy embedded in this build,
-                // never the one on GitHub.
-                let code = embedded_glue::get_glue(path).ok_or_else(|| {
-                    generic_error(format!(
-                        "{module_specifier} is not part of the Lodestone glue embedded in this build (no core/{path})"
-                    ))
-                })?;
-                let media_type = MediaType::from_path(Path::new(path));
-                let (module_type, should_transpile) = module_type_of(media_type)
-                    .ok_or_else(|| generic_error(format!("Unknown extension of {path}")))?;
-                debug!("Loading {module_specifier} from the embedded glue");
-                (code.to_string(), module_type, media_type, should_transpile)
-            } else {
-                match module_specifier.to_file_path() {
-                    Ok(path) => {
-                        let media_type = MediaType::from_path(&path);
-                        let Some((module_type, should_transpile)) = module_type_of(media_type)
-                        else {
-                            bail!("Unknown extension {:?}", path.extension());
-                        };
-
-                        (
-                            tokio::fs::read_to_string(&path).await?,
-                            module_type,
-                            media_type,
-                            should_transpile,
-                        )
-                    }
-                    Err(_) => {
-                        if module_specifier.scheme() == "http"
-                            || module_specifier.scheme() == "https"
-                        {
-                            let http_res = http.get(module_specifier.to_string()).send().await?;
-                            if !http_res.status().is_success() {
-                                bail!("Failed to fetch module: {module_specifier}");
-                            }
-                            let content_type = http_res
-                                .headers()
-                                .get("content-type")
-                                .and_then(|ct| ct.to_str().ok())
-                                .ok_or_else(|| generic_error("No content-type header"))?;
-                            let media_type =
-                                MediaType::from_content_type(&module_specifier, content_type);
-                            let Some((module_type, should_transpile)) =
-                                module_type_of(media_type)
-                            else {
-                                bail!("Unknown content-type {:?}", content_type);
-                            };
-                            let code = http_res.text().await?;
-                            (code, module_type, media_type, should_transpile)
-                        } else {
-                            bail!("Unsupported module specifier: {}", module_specifier);
-                        }
-                    }
-                }
-            };
-            let code = if should_transpile {
-                let parsed = deno_ast::parse_module(ParseParams {
-                    specifier: module_specifier.to_string(),
-                    text_info: SourceTextInfo::from_string(code),
-                    media_type,
-                    capture_tokens: false,
-                    scope_analysis: false,
-                    maybe_syntax: None,
-                })?;
-                parsed.transpile(&Default::default())?.text.into_boxed_str()
-            } else {
-                code.into_boxed_str()
-            };
-
-            let module = ModuleSource::new(module_type, ModuleCode::Owned(code), &module_specifier);
-            Ok(module)
-        }
-        .boxed_local()
-    }
-}
-
 /// Handle to a running macro, used to abort it from another thread.
 #[derive(Debug)]
 struct MacroHandle {
@@ -239,12 +104,20 @@ struct MacroHandle {
     /// Set before the isolate is terminated, so that the macro thread can tell
     /// an abort apart from an error thrown by the macro.
     aborted: Arc<AtomicBool>,
+    /// Wakes a macro whose event loop is idle (e.g. awaiting `next_event()`),
+    /// which `terminate_execution` alone cannot interrupt.
+    wake: Arc<Notify>,
 }
 
 impl MacroHandle {
     fn abort(&self) {
+        // The flag must be set before the macro thread can observe the
+        // termination.
         self.aborted.store(true, Ordering::SeqCst);
+        // interrupts running JS (busy loops) ...
         self.isolate_handle.terminate_execution();
+        // ... and wakes an idle event loop
+        self.wake.notify_one();
     }
 }
 
@@ -257,6 +130,7 @@ pub struct MacroExecutor {
         Arc<DashMap<MacroPID, (mpsc::UnboundedSender<Value>, mpsc::UnboundedSender<Value>)>>,
     event_broadcaster: EventBroadcaster,
     next_process_id: Arc<AtomicUsize>,
+    /// Lodestone's shared runtime, on which ops that touch instances run.
     rt: tokio::runtime::Handle,
 }
 
@@ -264,6 +138,239 @@ pub struct SpawnResult {
     pub macro_pid: MacroPID,
     pub detach_future: Pin<Box<dyn Future<Output = ()> + Send>>,
     pub exit_future: Pin<Box<dyn Future<Output = Result<ExitStatus, Error>> + Send>>,
+}
+
+/// Everything the macro thread needs.
+struct MacroThread {
+    pid: MacroPID,
+    main_module: ModuleSpecifier,
+    args: Vec<String>,
+    instance_uuid: Option<InstanceUuid>,
+    pre_injection_code: Option<String>,
+    fs_root: Option<PathBuf>,
+    extension_generator: Box<dyn ExtensionGenerator>,
+    event_broadcaster: EventBroadcaster,
+    process_table: Arc<DashMap<MacroPID, MacroHandle>>,
+    shared_runtime: tokio::runtime::Handle,
+}
+
+/// Build the `JsRuntime` of a macro.
+///
+/// `fs_root` is the only directory the macro can read and write through the
+/// `Deno.*` fs API; `None` means no fs access.
+pub(crate) fn build_runtime(
+    event_broadcaster: EventBroadcaster,
+    shared_runtime: tokio::runtime::Handle,
+    args: Vec<String>,
+    fs_root: Option<&Path>,
+    extra: Vec<deno_core::Extension>,
+) -> anyhow::Result<JsRuntime> {
+    let (permissions, root) = permissions::macro_permissions(fs_root)?;
+    let lodestone = extension::lodestone_extension(
+        event_broadcaster,
+        shared_runtime,
+        permissions,
+        args,
+        root,
+        &extra,
+    );
+    // Dependencies must come before their dependents (checked in debug builds).
+    let mut extensions = vec![
+        deno_webidl::deno_webidl::init(),
+        deno_web::deno_web::init(
+            Arc::new(deno_web::BlobStore::default()),
+            None,
+            false,
+            deno_web::InMemoryBroadcastChannel::default(),
+        ),
+        // deno_fetch's JS loads ext:deno_net/02_tls.js, so deno_net is needed
+        // although deno_fetch does not declare it.
+        deno_net::deno_net::init(None, None),
+        // deno_io replaces deno_core's op_print with one that writes to
+        // resources 1 and 2, so stdio must be registered or console.log
+        // throws. Console output goes to Lodestone's stdout/stderr, as it
+        // did with deno_runtime.
+        deno_io::deno_io::init(Some(deno_io::Stdio::default())),
+        deno_fs::deno_fs::init(deno_fs::sync::MaybeArc::new(deno_fs::RealFs)),
+        deno_fetch::deno_fetch::init(deno_fetch::Options {
+            user_agent: format!("Lodestone/{}", VERSION.with(|v| v.to_string())),
+            ..Default::default()
+        }),
+        lodestone,
+    ];
+    extensions.extend(extra);
+    for ext in &mut extensions {
+        extension::embed_sources(ext)?;
+    }
+    Ok(JsRuntime::try_new(RuntimeOptions {
+        module_loader: Some(Rc::new(TypescriptModuleLoader::default())),
+        extensions,
+        ..Default::default()
+    })?)
+}
+
+impl MacroThread {
+    /// Body of the macro thread. Reports exactly one `Stopped` event.
+    fn run(self) {
+        let pid = self.pid;
+        let instance_uuid = self.instance_uuid.clone();
+        let event_broadcaster = self.event_broadcaster.clone();
+        let stopped_sent = Arc::new(AtomicBool::new(false));
+        // Async ops `tokio::spawn` `!Send` futures (through deno_unsync),
+        // which is only sound on a current-thread runtime. So every macro has
+        // its own, and anything that has to outlive the macro runs on the
+        // shared runtime instead.
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to build the macro's tokio runtime")?;
+            rt.block_on(self.run_macro(stopped_sent.clone()));
+            Ok::<_, color_eyre::Report>(())
+        }));
+        debug!("MacroExecutor thread exited");
+        if stopped_sent.load(Ordering::SeqCst) {
+            return;
+        }
+        let error_msg = match outcome {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => "Macro executor thread unexpectedly panicked".to_string(),
+        };
+        error!("Macro {pid} failed: {error_msg}");
+        event_broadcaster.send(
+            MacroEvent {
+                macro_pid: pid,
+                macro_event_inner: MacroEventInner::Stopped {
+                    exit_status: ExitStatus::Error {
+                        time: chrono::Utc::now().timestamp(),
+                        error_msg,
+                    },
+                },
+                instance_uuid,
+            }
+            .into(),
+        );
+    }
+
+    async fn run_macro(self, stopped_sent: Arc<AtomicBool>) {
+        let MacroThread {
+            pid,
+            main_module,
+            args,
+            instance_uuid,
+            pre_injection_code,
+            fs_root,
+            extension_generator,
+            event_broadcaster,
+            process_table,
+            shared_runtime,
+        } = self;
+        let send_stopped = |exit_status: ExitStatus| {
+            stopped_sent.store(true, Ordering::SeqCst);
+            event_broadcaster.send(
+                MacroEvent {
+                    macro_pid: pid,
+                    macro_event_inner: MacroEventInner::Stopped { exit_status },
+                    instance_uuid: instance_uuid.clone(),
+                }
+                .into(),
+            );
+        };
+
+        let setup = || -> anyhow::Result<JsRuntime> {
+            let mut js = build_runtime(
+                event_broadcaster.clone(),
+                shared_runtime,
+                args,
+                fs_root.as_deref(),
+                extension_generator.generate(),
+            )?;
+            // `null` (not the string "null") when there is no instance
+            let instance_uuid_js = match &instance_uuid {
+                Some(uuid) => serde_json::to_string(uuid.as_ref())?,
+                None => "null".to_string(),
+            };
+            js.execute_script(
+                "deps_inject",
+                format!(
+                    "const __macro_pid = {}; const __instance_uuid = {};",
+                    pid.0, instance_uuid_js
+                ),
+            )?;
+            if let Some(config_code) = pre_injection_code {
+                js.execute_script("config_inject", config_code)?;
+            }
+            Ok(js)
+        };
+        let mut js = match setup() {
+            Ok(js) => js,
+            Err(e) => {
+                error!("Failed to set up macro {pid}: {e:#}");
+                send_stopped(ExitStatus::Error {
+                    error_msg: format!("Failed to set up the macro runtime: {e:#}"),
+                    time: chrono::Utc::now().timestamp(),
+                });
+                return;
+            }
+        };
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+        process_table.insert(
+            pid,
+            MacroHandle {
+                isolate_handle: js.v8_isolate().thread_safe_handle(),
+                aborted: aborted.clone(),
+                wake: wake.clone(),
+            },
+        );
+
+        event_broadcaster.send(
+            MacroEvent {
+                macro_pid: pid,
+                macro_event_inner: MacroEventInner::Started,
+                instance_uuid: instance_uuid.clone(),
+            }
+            .into(),
+        );
+
+        let run = async {
+            let id = js.load_main_es_module(&main_module).await?;
+            let evaluation = js.mod_evaluate(id);
+            js.run_event_loop(PollEventLoopOptions::default()).await?;
+            evaluation.await
+        };
+        let result = tokio::select! {
+            result = run => result.map_err(|e| e.to_string()),
+            _ = wake.notified() => Err("Macro execution was terminated".to_string()),
+        };
+
+        let exit_status = match result {
+            Ok(()) => {
+                debug!("Macro event loop exited");
+                ExitStatus::Success {
+                    time: chrono::Utc::now().timestamp(),
+                }
+            }
+            // An error after an abort is the termination itself, not a
+            // failure of the macro.
+            Err(_) if aborted.load(Ordering::SeqCst) => {
+                warn!("User terminated macro execution");
+                ExitStatus::Killed {
+                    time: chrono::Utc::now().timestamp(),
+                }
+            }
+            Err(error_msg) => {
+                error!("Error executing main module {main_module}: {error_msg}");
+                ExitStatus::Error {
+                    error_msg,
+                    time: chrono::Utc::now().timestamp(),
+                }
+            }
+        };
+        send_stopped(exit_status);
+    }
 }
 
 impl MacroExecutor {
@@ -302,24 +409,24 @@ impl MacroExecutor {
         }
     }
 
-    /// For timeout:
+    /// Run the macro at `path_to_main_module` on a new thread.
     ///
-    /// If `None`, the handle will never timeout.
+    /// `fs_root` is the directory the macro can read and write through the
+    /// `Deno.*` fs API (the instance directory); `Deno.cwd()` returns it and
+    /// relative paths resolve against it. `None` means no fs access.
     ///
-    /// If `Some(Duration)`, the handle will timeout after the duration.
-    ///
-    /// Note that this does not terminate the process, it just stops the handle from waiting for it.
-    ///
-    /// It is up to the caller to terminate the process if it is still running.
+    /// Returns once the macro has started. `exit_future` resolves when it
+    /// stops, `detach_future` when it asks to run in the background.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         path_to_main_module: PathBuf,
         args: Vec<String>,
         _caused_by: CausedBy,
-        worker_options_generator: Box<dyn WorkerOptionGenerator>,
+        extension_generator: Box<dyn ExtensionGenerator>,
         pre_injection_code: Option<String>,
         instance_uuid: Option<InstanceUuid>,
+        fs_root: Option<PathBuf>,
     ) -> Result<SpawnResult, Error> {
         let pid = MacroPID(self.next_process_id.fetch_add(1, Ordering::SeqCst));
         let exit_future = Box::pin({
@@ -333,207 +440,60 @@ impl MacroExecutor {
             }
         });
         let main_module = deno_core::resolve_path(
-            ".",
+            &path_to_main_module.to_string_lossy(),
             &std::env::current_dir().context("Failed to get current directory")?,
         )
-        .context("Failed to resolve path")?;
+        .context("Failed to resolve the path of the main module")?;
 
-        std::thread::spawn({
-            let process_table = self.macro_process_table.clone();
-            let event_broadcaster = self.event_broadcaster.clone();
-            let rt = self.rt.clone();
-            move || {
-                let _guard = rt.enter();
-                let local = LocalSet::new();
-                // whether the macro task reported its own exit status
-                let stopped_sent = Arc::new(AtomicBool::new(false));
-                local.spawn_local({
-                    let event_broadcaster = event_broadcaster.clone();
-                    let instance_uuid = instance_uuid.clone();
-                    let stopped_sent = stopped_sent.clone();
-                    async move {
-                        let mut worker_option = worker_options_generator.generate();
-                        worker_option.get_error_class_fn = Some(&deno_errors::get_error_class_name);
-                        register_prelude_ops(&mut worker_option);
-                        register_all_event_ops(&mut worker_option, event_broadcaster.clone());
-                        register_instance_control_ops(&mut worker_option);
+        // subscribe before the thread starts, so that no event is missed
+        let mut rx = self.event_broadcaster.subscribe();
 
-                        let mut main_worker = deno_runtime::worker::MainWorker::from_options(
-                            main_module,
-                            deno_runtime::permissions::PermissionsContainer::new(
-                                // TODO: limit permissions
-                                Permissions::allow_all(),
-                            ),
-                            worker_option,
-                        );
-                        main_worker.bootstrap(&deno_runtime::BootstrapOptions {
-                            args,
-                            ..Default::default()
-                        });
-                        // `null` (not the string "null") when there is no instance
-                        let instance_uuid_js = match &instance_uuid {
-                            Some(uuid) => serde_json::to_string(uuid.as_ref())
-                                .unwrap_or_else(|_| "null".to_string()),
-                            None => "null".to_string(),
-                        };
-                        main_worker
-                            .execute_script(
-                                "deps_inject",
-                                deno_core::FastString::Owned(
-                                    format!(
-                                        "const __macro_pid = {}; const __instance_uuid = {};",
-                                        pid.0, instance_uuid_js
-                                    )
-                                    .into_boxed_str(),
-                                ),
-                            )
-                            .unwrap();
+        let thread = MacroThread {
+            pid,
+            main_module,
+            args,
+            instance_uuid,
+            pre_injection_code,
+            fs_root,
+            extension_generator,
+            event_broadcaster: self.event_broadcaster.clone(),
+            process_table: self.macro_process_table.clone(),
+            shared_runtime: self.rt.clone(),
+        };
+        std::thread::Builder::new()
+            .name(format!("macro-{}", pid.0))
+            .spawn(move || thread.run())
+            .context("Failed to spawn macro thread")?;
 
-                        if let Some(config_code) = pre_injection_code {
-                            main_worker
-                                .execute_script("config_inject", ModuleCode::from(config_code))
-                                .unwrap();
-                        }
-
-                        let aborted = Arc::new(AtomicBool::new(false));
-                        process_table.insert(
-                            pid,
-                            MacroHandle {
-                                isolate_handle: main_worker
-                                    .js_runtime
-                                    .v8_isolate()
-                                    .thread_safe_handle(),
-                                aborted: aborted.clone(),
-                            },
-                        );
-
-                        // An error after an abort is the termination itself,
-                        // not a failure of the macro.
-                        let exit_status_on_error = |e: &anyhow::Error| {
-                            if aborted.load(Ordering::SeqCst) {
-                                warn!("User terminated macro execution");
-                                ExitStatus::Killed {
-                                    time: chrono::Utc::now().timestamp(),
-                                }
-                            } else {
-                                ExitStatus::Error {
-                                    error_msg: e.to_string(),
-                                    time: chrono::Utc::now().timestamp(),
-                                }
-                            }
-                        };
-
-                        let main_module = match deno_core::resolve_path(
-                            &path_to_main_module.to_string_lossy(),
-                            &std::env::current_dir().unwrap(),
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                error!("Error resolving main module: {}", e);
-                                return;
-                            }
-                        };
-
-                        event_broadcaster.send(
-                            MacroEvent {
-                                macro_pid: pid,
-                                macro_event_inner: MacroEventInner::Started,
-                                instance_uuid: instance_uuid.clone(),
-                            }
-                            .into(),
-                        );
-
-                        let exit_status = match main_worker.execute_main_module(&main_module).await
-                        {
-                            Err(e) => {
-                                let exit_status = exit_status_on_error(&e);
-                                if !matches!(exit_status, ExitStatus::Killed { .. }) {
-                                    error!("Error executing main module {main_module}: {}", e);
-                                }
-                                exit_status
-                            }
-                            Ok(()) => match main_worker.run_event_loop(false).await {
-                                Err(e) => {
-                                    let exit_status = exit_status_on_error(&e);
-                                    if !matches!(exit_status, ExitStatus::Killed { .. }) {
-                                        error!("Error running event loops: {}", e);
-                                    }
-                                    exit_status
-                                }
-                                Ok(()) => {
-                                    debug!("Macro event loop exited");
-                                    ExitStatus::Success {
-                                        time: chrono::Utc::now().timestamp(),
-                                    }
-                                }
-                            },
-                        };
-
-                        stopped_sent.store(true, Ordering::SeqCst);
-                        event_broadcaster.send(
-                            MacroEvent {
-                                macro_pid: pid,
-                                macro_event_inner: MacroEventInner::Stopped { exit_status },
-                                instance_uuid,
-                            }
-                            .into(),
-                        );
-
-                        // If the while loop returns, then all the LocalSpawner
-                        // objects have been dropped.
-                    }
-                });
-
-                // This will return once all senders are dropped and all
-                // spawned tasks have returned.
-                rt.block_on(local);
-                debug!("MacroExecutor thread exited");
-                if stopped_sent.load(Ordering::SeqCst) {
-                    return;
-                }
-                event_broadcaster.send(
-                    MacroEvent {
-                        macro_pid: pid,
-                        macro_event_inner: MacroEventInner::Stopped {
-                            exit_status: ExitStatus::Error {
-                                time: chrono::Utc::now().timestamp(),
-                                error_msg: "Macro executor thread unexpectedly panicked"
-                                    .to_string(),
-                            },
-                        },
-                        instance_uuid: instance_uuid.clone(),
-                    }
-                    .into(),
-                );
-            }
-        });
-
-        // listen to event broadcaster for macro started event
-        // and return the pid
-
-        let rx = self.event_broadcaster.subscribe();
-
-        let fut = async move {
-            let mut rx = rx;
+        // wait until the macro has started, or failed to
+        let started = async move {
             loop {
-                if let Ok(event) = rx.recv().await {
-                    if let EventInner::MacroEvent(MacroEvent {
-                        macro_pid,
-                        macro_event_inner: MacroEventInner::Started,
-                        ..
-                    }) = event.event_inner
-                    {
-                        if macro_pid == pid {
-                            return Ok(macro_pid);
-                        }
+                let event = match rx.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break Err(eyre!("Failed to receive macro started event")),
+                };
+                if let EventInner::MacroEvent(MacroEvent {
+                    macro_pid,
+                    macro_event_inner,
+                    ..
+                }) = event.event_inner
+                {
+                    if macro_pid != pid {
+                        continue;
                     }
-                } else {
-                    break Err(eyre!("Failed to receive macro started event"));
+                    match macro_event_inner {
+                        MacroEventInner::Started => break Ok(()),
+                        MacroEventInner::Stopped { exit_status } => {
+                            break Err(eyre!("Macro stopped before it started: {exit_status:?}"))
+                        }
+                        _ => {}
+                    }
                 }
             }
         };
 
-        tokio::time::timeout(Duration::from_secs(1), fut)
+        tokio::time::timeout(Duration::from_secs(10), started)
             .await
             .context("Failed to spawn macro")??;
         Ok(SpawnResult {
@@ -976,43 +936,47 @@ fn get_config_value_type(type_str: &str) -> Result<ConfigurableValueType, Error>
 #[cfg(test)]
 mod tests {
 
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
-    use deno_core::op;
+    use deno_core::{op2, OpState};
 
-    use super::{TypescriptModuleLoader, WorkerOptionGenerator};
+    use super::{DefaultExtensionGenerator, ExtensionGenerator};
 
+    use crate::deno_ops::{run_on_shared, MacroOpError};
     use crate::event_broadcaster::EventBroadcaster;
     use crate::events::CausedBy;
     use crate::macro_executor::{
         extract_config_code, get_config_from_code, parse_config_single, SpawnResult,
     };
     use crate::traits::t_configurable::manifest::ConfigurableValue;
+    use crate::traits::t_macro::ExitStatus;
 
-    struct BasicMainWorkerGenerator;
-
-    #[op]
+    #[op2]
+    #[string]
     fn hello_world() -> String {
         "Hello World".to_string()
     }
 
-    #[op]
+    #[op2]
+    #[string]
     async fn async_hello_world() -> String {
         "async Hello World".to_string()
     }
 
-    impl WorkerOptionGenerator for BasicMainWorkerGenerator {
-        fn generate(&self) -> deno_runtime::worker::WorkerOptions {
-            let ext = deno_core::Extension::builder("generic_deno_extension_builder")
-                .ops(vec![hello_world::decl(), async_hello_world::decl()])
-                .build();
-            deno_runtime::worker::WorkerOptions {
-                module_loader: Rc::new(TypescriptModuleLoader::default()),
-                extensions: vec![ext],
-                ..Default::default()
-            }
+    deno_core::extension!(test_hello_ops, ops = [hello_world, async_hello_world]);
+
+    struct BasicExtensionGenerator;
+
+    impl ExtensionGenerator for BasicExtensionGenerator {
+        fn generate(&self) -> Vec<deno_core::Extension> {
+            vec![test_hello_ops::init()]
         }
     }
+
     #[tokio::test]
     async fn basic_execution() {
         // init tracing
@@ -1040,20 +1004,23 @@ mod tests {
         )
         .unwrap();
 
-        let basic_worker_generator = BasicMainWorkerGenerator;
-
         let SpawnResult { exit_future, .. } = executor
             .spawn(
                 path_to_macro,
                 Vec::new(),
                 CausedBy::Unknown,
-                Box::new(basic_worker_generator),
+                Box::new(BasicExtensionGenerator),
+                None,
                 None,
                 None,
             )
             .await
             .unwrap();
-        exit_future.await.unwrap();
+        let exit_status = exit_future.await.unwrap();
+        assert!(
+            matches!(exit_status, ExitStatus::Success { .. }),
+            "{exit_status:?}"
+        );
     }
 
     #[tokio::test]
@@ -1081,20 +1048,193 @@ mod tests {
         )
         .unwrap();
 
-        let basic_worker_generator = BasicMainWorkerGenerator;
-
         let SpawnResult { exit_future, .. } = executor
             .spawn(
                 path_to_macro,
                 Vec::new(),
                 CausedBy::Unknown,
-                Box::new(basic_worker_generator),
+                Box::new(BasicExtensionGenerator),
+                None,
                 None,
                 None,
             )
             .await
             .unwrap();
         exit_future.await.unwrap();
+    }
+
+    /// Every Lodestone op name must be unique among all the ops in the
+    /// runtime: deno_core only checks for duplicates in debug builds (by
+    /// panicking), and a release build would silently shadow one of them.
+    #[tokio::test]
+    async fn lodestone_op_names_do_not_collide() {
+        let (event_broadcaster, _rx) = EventBroadcaster::new(10);
+        let shared = tokio::runtime::Handle::current();
+        // Lodestone's ops, including the procedure bridge's
+        let ours: Vec<&'static str> = super::extension::lodestone::init(
+            event_broadcaster.clone(),
+            shared.clone(),
+            super::permissions::macro_permissions(None).unwrap().0,
+        )
+        .ops
+        .iter()
+        .chain(
+            crate::implementations::generic::procedure_bridge_extension_for_tests()
+                .ops
+                .iter(),
+        )
+        .map(|decl| decl.name)
+        .collect();
+        // 41 in `lodestone` (with lodestone_bootstrap_info), 3 in the bridge
+        assert_eq!(ours.len(), 44, "{ours:?}");
+
+        let js = super::build_runtime(
+            event_broadcaster,
+            shared,
+            Vec::new(),
+            None,
+            vec![crate::implementations::generic::procedure_bridge_extension_for_tests()],
+        )
+        .expect("failed to build the runtime (a duplicate op name panics in debug builds)");
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for name in js.op_names() {
+            *counts.entry(name).or_default() += 1;
+        }
+        let collisions: Vec<_> = ours
+            .iter()
+            .filter(|name| counts.get(*name).copied().unwrap_or(0) != 1)
+            .map(|name| (*name, counts.get(name).copied().unwrap_or(0)))
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "op names not registered exactly once: {collisions:?}"
+        );
+    }
+
+    /// Set by the task that [`spawn_task_on_shared_runtime`] spawns.
+    static SHARED_TASK_DONE: AtomicBool = AtomicBool::new(false);
+
+    /// Does what an instance-control op does when it calls into instance
+    /// code: run through [`run_on_shared`], where the instance code
+    /// `tokio::spawn`s a long-lived task (like a server's supervision task).
+    #[op2]
+    #[string]
+    async fn spawn_task_on_shared_runtime(
+        state: Rc<RefCell<OpState>>,
+    ) -> Result<String, MacroOpError> {
+        run_on_shared(&state, async {
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                SHARED_TASK_DONE.store(true, Ordering::SeqCst);
+            });
+            Ok(format!(
+                "{:?} on {}",
+                tokio::runtime::Handle::current().runtime_flavor(),
+                std::thread::current().name().unwrap_or("<unnamed>")
+            ))
+        })
+        .await
+    }
+
+    deno_core::extension!(test_shared_ops, ops = [spawn_task_on_shared_runtime]);
+
+    struct SharedOpsGenerator;
+
+    impl ExtensionGenerator for SharedOpsGenerator {
+        fn generate(&self) -> Vec<deno_core::Extension> {
+            vec![test_shared_ops::init()]
+        }
+    }
+
+    /// Op bodies run through `run_on_shared` execute on the shared runtime,
+    /// not on the macro's thread, and tasks they spawn outlive the macro.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ops_run_on_the_shared_runtime() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (event_broadcaster, _rx) = EventBroadcaster::new(10);
+        let executor =
+            super::MacroExecutor::new(event_broadcaster, tokio::runtime::Handle::current());
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.js");
+        std::fs::write(
+            &path,
+            r#"
+            const where = await Deno[Deno.internal].core.opAsync("spawn_task_on_shared_runtime");
+            if (!where.startsWith("MultiThread on ") || where.includes("macro-")) {
+                throw new Error("op ran on the wrong runtime: " + where);
+            }
+            "#,
+        )
+        .unwrap();
+        let SpawnResult { exit_future, .. } = executor
+            .spawn(
+                path,
+                Vec::new(),
+                CausedBy::Unknown,
+                Box::new(SharedOpsGenerator),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let exit_status = exit_future.await.unwrap();
+        assert!(
+            matches!(exit_status, ExitStatus::Success { .. }),
+            "{exit_status:?}"
+        );
+        // the macro, and its runtime, are gone; the spawned task is not done yet
+        assert!(!SHARED_TASK_DONE.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !SHARED_TASK_DONE.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the task spawned by the op did not outlive the macro");
+    }
+
+    /// A macro awaiting an op that never resolves (an idle event loop) can be
+    /// killed too, not only one running JS.
+    #[tokio::test]
+    async fn abort_idle_macro() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (event_broadcaster, _rx) = EventBroadcaster::new(10);
+        let executor =
+            super::MacroExecutor::new(event_broadcaster, tokio::runtime::Handle::current());
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.js");
+        std::fs::write(
+            &path,
+            r#"await Deno[Deno.internal].core.opAsync("next_event");"#,
+        )
+        .unwrap();
+        let SpawnResult {
+            macro_pid,
+            exit_future,
+            ..
+        } = executor
+            .spawn(
+                path,
+                Vec::new(),
+                CausedBy::Unknown,
+                Box::new(DefaultExtensionGenerator),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        executor.abort_macro(macro_pid).unwrap();
+        let exit_status = tokio::time::timeout(Duration::from_secs(10), exit_future)
+            .await
+            .expect("the idle macro was not killed")
+            .unwrap();
+        assert!(
+            matches!(exit_status, ExitStatus::Killed { .. }),
+            "{exit_status:?}"
+        );
     }
 
     #[test]
@@ -1197,72 +1337,5 @@ mod tests {
                 None
             );
         }
-    }
-}
-
-mod deno_errors {
-    // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
-
-    //! There are many types of errors in Deno:
-    //! - AnyError: a generic wrapper that can encapsulate any type of error.
-    //! - JsError: a container for the error message and stack trace for exceptions
-    //!   thrown in JavaScript code. We use this to pretty-print stack traces.
-    //! - Diagnostic: these are errors that originate in TypeScript's compiler.
-    //!   They're similar to JsError, in that they have line numbers. But
-    //!   Diagnostics are compile-time type errors, whereas JsErrors are runtime
-    //!   exceptions.
-
-    use deno_ast::Diagnostic;
-    use deno_core::error::AnyError;
-    use deno_graph::ModuleError;
-    use deno_graph::ModuleGraphError;
-    use deno_graph::ResolutionError;
-    use import_map::ImportMapError;
-
-    fn get_import_map_error_class(_: &ImportMapError) -> &'static str {
-        "URIError"
-    }
-
-    fn get_diagnostic_class(_: &Diagnostic) -> &'static str {
-        "SyntaxError"
-    }
-
-    fn get_module_graph_error_class(err: &ModuleGraphError) -> &'static str {
-        match err {
-            ModuleGraphError::ModuleError(err) => match err {
-                ModuleError::LoadingErr(_, _, err) => get_error_class_name(err.as_ref()),
-                ModuleError::InvalidTypeAssertion { .. } => "SyntaxError",
-                ModuleError::ParseErr(_, diagnostic) => get_diagnostic_class(diagnostic),
-                ModuleError::UnsupportedMediaType { .. }
-                | ModuleError::UnsupportedImportAssertionType { .. } => "TypeError",
-                ModuleError::Missing(_, _) | ModuleError::MissingDynamic(_, _) => "NotFound",
-            },
-            ModuleGraphError::ResolutionError(err) => get_resolution_error_class(err),
-        }
-    }
-
-    fn get_resolution_error_class(err: &ResolutionError) -> &'static str {
-        match err {
-            ResolutionError::ResolverError { error, .. } => get_error_class_name(error.as_ref()),
-            _ => "TypeError",
-        }
-    }
-
-    pub fn get_error_class_name(e: &AnyError) -> &'static str {
-        deno_runtime::errors::get_error_class_name(e)
-            .or_else(|| {
-                e.downcast_ref::<ImportMapError>()
-                    .map(get_import_map_error_class)
-            })
-            .or_else(|| e.downcast_ref::<Diagnostic>().map(get_diagnostic_class))
-            .or_else(|| {
-                e.downcast_ref::<ModuleGraphError>()
-                    .map(get_module_graph_error_class)
-            })
-            .or_else(|| {
-                e.downcast_ref::<ResolutionError>()
-                    .map(get_resolution_error_class)
-            })
-            .unwrap_or("Error")
     }
 }

@@ -15,7 +15,7 @@ use crate::implementations::minecraft::line_parser::{
 };
 use crate::implementations::minecraft::player::MinecraftPlayer;
 use crate::implementations::minecraft::util::name_to_uuid;
-use crate::macro_executor::{DefaultWorkerOptionGenerator, SpawnResult};
+use crate::macro_executor::{DefaultExtensionGenerator, SpawnResult};
 use crate::traits::t_configurable::TConfigurable;
 use crate::traits::t_macro::TaskEntry;
 use crate::traits::t_server::{MonitorReport, State, StateAction, TServer};
@@ -62,9 +62,10 @@ impl TServer for MinecraftInstance {
                     prelaunch,
                     Vec::new(),
                     CausedBy::System,
-                    Box::new(DefaultWorkerOptionGenerator),
+                    Box::new(DefaultExtensionGenerator),
                     None,
                     Some(self.uuid.clone()),
+                    Some(self.path_to_instance.clone()),
                 )
                 .await;
 

@@ -12,7 +12,7 @@ use crate::traits::t_configurable::manifest::{
 use crate::{
     error::Error,
     events::CausedBy,
-    macro_executor::{DefaultWorkerOptionGenerator, MacroPID, SpawnResult},
+    macro_executor::{DefaultExtensionGenerator, MacroPID, SpawnResult},
     traits::t_macro::{HistoryEntry, MacroEntry, TMacro, TaskEntry},
 };
 
@@ -158,9 +158,10 @@ impl TMacro for MinecraftInstance {
                 path_to_macro,
                 args,
                 caused_by,
-                Box::new(DefaultWorkerOptionGenerator),
+                Box::new(DefaultExtensionGenerator),
                 config_code,
                 Some(self.uuid.clone()),
+                Some(self.path_to_instance.clone()),
             )
             .await?;
         let entry = TaskEntry {

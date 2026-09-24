@@ -1,18 +1,15 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use color_eyre::eyre::Context;
 use tracing::{debug, error};
 
-use self::{
-    bridge::procedure_call::{emit_result, next_procedure, proc_bridge_ready, ProcedureCallInner},
-    r#macro::GenericMainWorkerGenerator,
-};
+use self::{bridge::procedure_call::ProcedureCallInner, r#macro::ProcedureBridgeExtension};
 use crate::{
     error::Error,
     event_broadcaster::EventBroadcaster,
     events::{CausedBy, ProgressionEventID},
-    macro_executor::{self, MacroExecutor, MacroPID, SpawnResult, WorkerOptionGenerator},
+    macro_executor::{MacroExecutor, MacroPID, SpawnResult},
     traits::{
         t_configurable::{
             manifest::{SetupManifest, SetupValue},
@@ -59,31 +56,13 @@ impl Drop for GenericDropGuard {
     }
 }
 
-struct InitWorkerGenerator {
-    pub bridge: bridge::procedure_call::ProcedureBridge,
-}
-
-impl WorkerOptionGenerator for InitWorkerGenerator {
-    fn generate(&self) -> deno_runtime::worker::WorkerOptions {
-        let ext = deno_core::Extension::builder("generic_deno_extension_builder")
-            .ops(vec![
-                next_procedure::decl(),
-                emit_result::decl(),
-                proc_bridge_ready::decl(),
-            ])
-            .state({
-                let brige = self.bridge.clone();
-                move |state| {
-                    state.put(brige);
-                }
-            })
-            .build();
-        deno_runtime::worker::WorkerOptions {
-            extensions: vec![ext],
-            module_loader: Rc::new(macro_executor::TypescriptModuleLoader::default()),
-            ..Default::default()
-        }
-    }
+/// The procedure bridge extension with a fresh bridge, for tests that need
+/// its op names.
+#[cfg(test)]
+pub(crate) fn procedure_bridge_extension_for_tests() -> deno_core::Extension {
+    bridge::procedure_call::lodestone_procedure_bridge::init(
+        bridge::procedure_call::ProcedureBridge::new(),
+    )
 }
 
 impl GenericInstance {
@@ -134,9 +113,10 @@ impl GenericInstance {
                 path_to_bootstrap,
                 Vec::new(),
                 CausedBy::System,
-                Box::new(GenericMainWorkerGenerator::new(procedure_bridge.clone())),
+                Box::new(ProcedureBridgeExtension::new(procedure_bridge.clone())),
                 None,
                 Some(dot_lodestone_config.uuid().clone()),
+                Some(path.clone()),
             )
             .await?;
         detach_future.await;
@@ -178,9 +158,10 @@ impl GenericInstance {
                 path_to_instance.join("run.ts"),
                 Vec::new(),
                 CausedBy::System,
-                Box::new(GenericMainWorkerGenerator::new(procedure_bridge.clone())),
+                Box::new(ProcedureBridgeExtension::new(procedure_bridge.clone())),
                 None,
                 Some(dot_lodestone_config.uuid().clone()),
+                Some(path_to_instance.clone()),
             )
             .await?;
 
@@ -235,10 +216,11 @@ impl GenericInstance {
                 temp_file_path,
                 Vec::new(),
                 CausedBy::System,
-                Box::new(InitWorkerGenerator {
-                    bridge: procedure_bridge.clone(),
-                }),
+                Box::new(ProcedureBridgeExtension::new(procedure_bridge.clone())),
                 None,
+                None,
+                // No instance exists yet, so no fs access: getting the setup
+                // manifest should not need any.
                 None,
             )
             .await?;

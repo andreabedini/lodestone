@@ -5,15 +5,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use color_eyre::eyre::eyre;
-use deno_core::anyhow::anyhow;
-use deno_core::{anyhow, op, OpState};
+use deno_core::{op2, OpState};
 use enum_kinds::EnumKind;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::error;
 use ts_rs::TS;
 
+use crate::deno_ops::MacroOpError;
 use crate::error::{Error, ErrorKind};
 use crate::events::CausedBy;
 
@@ -342,19 +343,24 @@ pub struct ProcedureCallResultIR {
     error: Option<ErrorIR>,
 }
 
-#[op]
-async fn next_procedure(state: Rc<RefCell<OpState>>) -> Result<ProcedureCall, anyhow::Error> {
+// The procedure bridge ops only use channels, which work from any runtime, so
+// they run on the macro's own runtime.
+
+#[op2]
+#[serde]
+pub async fn next_procedure(state: Rc<RefCell<OpState>>) -> Result<ProcedureCall, MacroOpError> {
     let bridge = state.borrow().borrow::<ProcedureBridge>().clone();
     let mut rx = bridge.procedure_rx.lock().await;
-    Ok(rx.recv().await?)
+    Ok(rx.recv().await.map_err(anyhow::Error::from)?)
 }
 
-#[op]
-fn proc_bridge_ready(state: Rc<RefCell<OpState>>) -> Result<String, anyhow::Error> {
-    let bridge = state.borrow().borrow::<ProcedureBridge>().clone();
+#[op2]
+#[string]
+pub fn proc_bridge_ready(state: &mut OpState) -> Result<String, MacroOpError> {
+    let bridge = state.borrow::<ProcedureBridge>();
     // if already ready, return error
     if bridge.ready.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(anyhow!("ProcedureBridge::proc_bridge_ready: already ready"));
+        return Err(anyhow!("ProcedureBridge::proc_bridge_ready: already ready").into());
     }
     bridge
         .ready
@@ -362,12 +368,12 @@ fn proc_bridge_ready(state: Rc<RefCell<OpState>>) -> Result<String, anyhow::Erro
     Ok("".to_string())
 }
 
-#[op]
-fn emit_result(
-    state: Rc<RefCell<OpState>>,
-    result: ProcedureCallResultIR,
-) -> Result<(), anyhow::Error> {
-    let bridge = state.borrow().borrow::<ProcedureBridge>().clone();
+#[op2]
+pub fn emit_result(
+    state: &mut OpState,
+    #[serde] result: ProcedureCallResultIR,
+) -> Result<(), MacroOpError> {
+    let bridge = state.borrow::<ProcedureBridge>();
     let _rx = bridge.procedure_result_tx.subscribe();
     bridge
         .procedure_result_tx
@@ -375,6 +381,15 @@ fn emit_result(
         .map_err(|_| anyhow!("ProcedureBridge::emit_result: procedure_result_tx closed"))?;
     Ok(())
 }
+
+deno_core::extension!(
+    lodestone_procedure_bridge,
+    ops = [next_procedure, emit_result, proc_bridge_ready],
+    options = { bridge: ProcedureBridge },
+    state = |state, options| {
+        state.put(options.bridge);
+    },
+);
 
 #[derive(Debug, Clone)]
 pub struct ProcedureBridge {

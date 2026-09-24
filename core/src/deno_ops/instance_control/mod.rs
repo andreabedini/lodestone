@@ -1,10 +1,18 @@
+//! Instance-control ops.
+//!
+//! Every op that awaits instance code runs its body on the shared runtime
+//! through [`run_on_shared`], because instance methods spawn tasks and own IO
+//! objects that must not be tied to the macro's runtime. `instance_exists` and
+//! `all_instances` only read the instance map, so they stay synchronous.
+
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use deno_core::{
-    anyhow::{self, bail, Context},
-    op,
-};
+use anyhow::{bail, Context};
+use deno_core::{op2, OpState};
 
+use super::{run_on_shared, MacroOpError};
 use crate::{
     events::CausedBy,
     macro_executor::MacroPID,
@@ -31,13 +39,14 @@ fn get_instance(instance_uuid: &InstanceUuid) -> Result<GameInstance, anyhow::Er
         .ok_or_else(|| anyhow::anyhow!("Instance not found"))
 }
 
-#[op]
-fn instance_exists(instance_uuid: InstanceUuid) -> bool {
+#[op2]
+pub fn instance_exists(#[serde] instance_uuid: InstanceUuid) -> bool {
     app_state().instances.contains_key(&instance_uuid)
 }
 
-#[op]
-fn all_instances() -> Vec<InstanceUuid> {
+#[op2]
+#[serde]
+pub fn all_instances() -> Vec<InstanceUuid> {
     app_state()
         .instances
         .iter()
@@ -45,304 +54,405 @@ fn all_instances() -> Vec<InstanceUuid> {
         .collect()
 }
 
-#[op]
-async fn start_instance(
-    instance_uuid: InstanceUuid,
-    task_pid: MacroPID,
+#[op2]
+pub async fn start_instance(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[serde] task_pid: MacroPID,
     block: bool,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    instance
-        .start(
-            CausedBy::Macro {
-                macro_pid: task_pid,
-            },
-            block,
-        )
-        .await
-        .context("Failed to start instance")
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        instance
+            .start(
+                CausedBy::Macro {
+                    macro_pid: task_pid,
+                },
+                block,
+            )
+            .await
+            .context("Failed to start instance")
+    })
+    .await
 }
 
-#[op]
-async fn stop_instance(
-    instance_uuid: InstanceUuid,
-    task_pid: MacroPID,
+#[op2]
+pub async fn stop_instance(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[serde] task_pid: MacroPID,
     block: bool,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    instance
-        .stop(
-            CausedBy::Macro {
-                macro_pid: task_pid,
-            },
-            block,
-        )
-        .await
-        .context("Failed to stop instance")
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        instance
+            .stop(
+                CausedBy::Macro {
+                    macro_pid: task_pid,
+                },
+                block,
+            )
+            .await
+            .context("Failed to stop instance")
+    })
+    .await
 }
 
-#[op]
-async fn restart_instance(
-    instance_uuid: InstanceUuid,
-    task_pid: MacroPID,
+#[op2]
+pub async fn restart_instance(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[serde] task_pid: MacroPID,
     block: bool,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    instance
-        .restart(
-            CausedBy::Macro {
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        instance
+            .restart(
+                CausedBy::Macro {
+                    macro_pid: task_pid,
+                },
+                block,
+            )
+            .await
+            .context("Failed to restart instance")
+    })
+    .await
+}
+
+#[op2]
+pub async fn kill_instance(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[serde] task_pid: MacroPID,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        instance
+            .kill(CausedBy::Macro {
                 macro_pid: task_pid,
-            },
-            block,
-        )
-        .await
-        .context("Failed to restart instance")
+            })
+            .await
+            .context("Failed to kill instance")
+    })
+    .await
 }
 
-#[op]
-async fn kill_instance(
-    instance_uuid: InstanceUuid,
-    task_pid: MacroPID,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    instance
-        .kill(CausedBy::Macro {
-            macro_pid: task_pid,
-        })
-        .await
-        .context("Failed to kill instance")
+#[op2]
+#[serde]
+pub async fn get_instance_state(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<State, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+
+        Ok(instance.state().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_state(instance_uuid: InstanceUuid) -> Result<State, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-
-    Ok(instance.state().await)
+#[op2]
+pub async fn send_command(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[string] command: String,
+    #[serde] task_pid: MacroPID,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        instance
+            .send_command(
+                &command,
+                CausedBy::Macro {
+                    macro_pid: task_pid,
+                },
+            )
+            .await
+            .context("Failed to send command")
+    })
+    .await
 }
 
-#[op]
-async fn send_command(
-    instance_uuid: InstanceUuid,
-    command: String,
-    task_pid: MacroPID,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    instance
-        .send_command(
-            &command,
-            CausedBy::Macro {
-                macro_pid: task_pid,
-            },
-        )
-        .await
-        .context("Failed to send command")
+#[op2]
+#[serde]
+pub async fn monitor_instance(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<MonitorReport, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.monitor().await)
+    })
+    .await
 }
 
-#[op]
-async fn monitor_instance(instance_uuid: InstanceUuid) -> Result<MonitorReport, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.monitor().await)
+#[op2]
+pub async fn get_instance_player_count(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<u32, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.get_player_count().await?)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_player_count(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.get_player_count().await?)
+#[op2]
+pub async fn get_instance_max_players(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<u32, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.get_max_player_count().await?)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_max_players(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.get_max_player_count().await?)
+#[op2]
+#[serde]
+pub async fn get_instance_player_list(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<HashSet<Player>, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.get_player_list().await?)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_player_list(
-    instance_uuid: InstanceUuid,
-) -> Result<HashSet<Player>, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.get_player_list().await?)
+#[op2]
+#[string]
+pub async fn get_instance_name(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<String, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.name().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_name(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.name().await)
+#[op2]
+#[serde]
+pub async fn get_instance_game(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<Game, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.game_type().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_game(instance_uuid: InstanceUuid) -> Result<Game, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.game_type().await)
+#[op2]
+#[string]
+pub async fn get_instance_game_version(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<String, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.version().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_game_version(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.version().await)
+#[op2]
+#[string]
+pub async fn get_instance_description(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<String, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.description().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_description(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.description().await)
+#[op2]
+pub async fn get_instance_port(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<u32, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.port().await)
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_port(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.port().await)
+#[op2]
+#[string]
+pub async fn get_instance_path(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<String, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        Ok(instance.path().await.to_string_lossy().to_string())
+    })
+    .await
 }
 
-#[op]
-async fn get_instance_path(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    Ok(instance.path().await.to_string_lossy().to_string())
+#[op2]
+pub async fn set_instance_name(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[string] name: String,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+
+        instance
+            .set_name(name)
+            .await
+            .context("Failed to set instance name")
+    })
+    .await
 }
 
-#[op]
-async fn set_instance_name(instance_uuid: InstanceUuid, name: String) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
+#[op2]
+pub async fn set_instance_description(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[string] description: String,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
 
-    instance
-        .set_name(name)
-        .await
-        .context("Failed to set instance name")
+        instance
+            .set_description(description)
+            .await
+            .context("Failed to set instance description")
+    })
+    .await
 }
 
-#[op]
-async fn set_instance_description(
-    instance_uuid: InstanceUuid,
-    description: String,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
+#[op2]
+pub async fn set_instance_port(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    port: u32,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
 
-    instance
-        .set_description(description)
-        .await
-        .context("Failed to set instance description")
+        instance
+            .set_port(port)
+            .await
+            .context("Failed to set instance port")
+    })
+    .await
 }
 
-#[op]
-async fn set_instance_port(instance_uuid: InstanceUuid, port: u32) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-
-    instance
-        .set_port(port)
-        .await
-        .context("Failed to set instance port")
-}
-
-#[op]
-async fn set_instance_auto_start(
-    instance_uuid: InstanceUuid,
+#[op2]
+pub async fn set_instance_auto_start(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
     auto_start: bool,
-) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
 
-    instance
-        .set_auto_start(auto_start)
-        .await
-        .context("Failed to set instance auto start")
+        instance
+            .set_auto_start(auto_start)
+            .await
+            .context("Failed to set instance auto start")
+    })
+    .await
 }
 
-#[op]
-async fn is_rcon_available(instance_uuid: InstanceUuid) -> Result<bool, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    match &instance {
-        GameInstance::MinecraftInstance(v) => Ok(v.get_rcon().lock().await.is_some()),
-        GameInstance::GenericInstance(_) => {
-            bail!("RCON not available for atom instances")
-        }
-    }
-}
-
-#[op]
-async fn try_send_rcon_command(
-    instance_uuid: InstanceUuid,
-    command: String,
-) -> Result<Option<String>, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    match &instance {
-        GameInstance::MinecraftInstance(v) => Ok(v.send_rcon(&command).await.ok()),
-        GameInstance::GenericInstance(_) => {
-            bail!("RCON not available for atom instances")
-        }
-    }
-}
-
-#[op]
-async fn send_rcon_command(
-    instance_uuid: InstanceUuid,
-    command: String,
-) -> Result<String, anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    match &instance {
-        GameInstance::MinecraftInstance(v) => {
-            let rcon = v.get_rcon();
-            loop {
-                if let Some(rcon) = rcon.lock().await.as_mut() {
-                    return Ok(rcon.cmd(&command).await?);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+#[op2]
+pub async fn is_rcon_available(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<bool, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        match &instance {
+            GameInstance::MinecraftInstance(v) => Ok(v.get_rcon().lock().await.is_some()),
+            GameInstance::GenericInstance(_) => {
+                bail!("RCON not available for atom instances")
             }
         }
-        GameInstance::GenericInstance(_) => {
-            bail!("RCON not available for atom instances")
-        }
-    }
+    })
+    .await
 }
 
-#[op]
-async fn wait_till_rcon_available(instance_uuid: InstanceUuid) -> Result<(), anyhow::Error> {
-    let instance = get_instance(&instance_uuid)?;
-    match &instance {
-        GameInstance::MinecraftInstance(v) => {
-            let rcon = v.get_rcon();
-            loop {
-                if rcon.lock().await.is_some() {
-                    break Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+#[op2]
+#[string]
+pub async fn try_send_rcon_command(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[string] command: String,
+) -> Result<Option<String>, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        match &instance {
+            GameInstance::MinecraftInstance(v) => Ok(v.send_rcon(&command).await.ok()),
+            GameInstance::GenericInstance(_) => {
+                bail!("RCON not available for atom instances")
             }
         }
-        GameInstance::GenericInstance(_) => {
-            bail!("RCON not available for atom instances")
-        }
-    }
+    })
+    .await
 }
 
-pub fn register_instance_control_ops(worker_options: &mut deno_runtime::worker::WorkerOptions) {
-    worker_options.extensions.push(
-        deno_core::Extension::builder("instance_control_ops")
-            .ops(vec![
-                instance_exists::decl(),
-                all_instances::decl(),
-                get_instance_state::decl(),
-                get_instance_path::decl(),
-                get_instance_name::decl(),
-                get_instance_player_count::decl(),
-                get_instance_max_players::decl(),
-                get_instance_player_list::decl(),
-                get_instance_game::decl(),
-                get_instance_game_version::decl(),
-                get_instance_description::decl(),
-                get_instance_port::decl(),
-                set_instance_name::decl(),
-                set_instance_description::decl(),
-                set_instance_port::decl(),
-                set_instance_auto_start::decl(),
-                start_instance::decl(),
-                stop_instance::decl(),
-                restart_instance::decl(),
-                monitor_instance::decl(),
-                send_command::decl(),
-                kill_instance::decl(),
-                is_rcon_available::decl(),
-                try_send_rcon_command::decl(),
-                send_rcon_command::decl(),
-                wait_till_rcon_available::decl(),
-            ])
-            .build(),
-    );
+#[op2]
+#[string]
+pub async fn send_rcon_command(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+    #[string] command: String,
+) -> Result<String, MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        match &instance {
+            GameInstance::MinecraftInstance(v) => {
+                let rcon = v.get_rcon();
+                loop {
+                    if let Some(rcon) = rcon.lock().await.as_mut() {
+                        return Ok(rcon.cmd(&command).await?);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            GameInstance::GenericInstance(_) => {
+                bail!("RCON not available for atom instances")
+            }
+        }
+    })
+    .await
+}
+
+#[op2]
+pub async fn wait_till_rcon_available(
+    state: Rc<RefCell<OpState>>,
+    #[serde] instance_uuid: InstanceUuid,
+) -> Result<(), MacroOpError> {
+    run_on_shared(&state, async move {
+        let instance = get_instance(&instance_uuid)?;
+        match &instance {
+            GameInstance::MinecraftInstance(v) => {
+                let rcon = v.get_rcon();
+                loop {
+                    if rcon.lock().await.is_some() {
+                        break Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            GameInstance::GenericInstance(_) => {
+                bail!("RCON not available for atom instances")
+            }
+        }
+    })
+    .await
 }

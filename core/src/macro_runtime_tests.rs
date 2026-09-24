@@ -938,3 +938,86 @@ async fn macro_status_is_the_reported_exit_status() {
     .expect("macro status was never recorded");
     assert!(matches!(status, ExitStatus::Success { .. }), "{status:?}");
 }
+
+// ---------------------------------------------------------------------------
+// embedded glue
+
+/// URL of a glue file under `core/` on upstream's `dev` branch, which the
+/// loader serves from the embedded copy.
+fn upstream_glue_url(relative: &str) -> String {
+    format!(
+        "{}{relative}",
+        crate::embedded_glue::EMBEDDED_GLUE_URL_PREFIXES[0]
+    )
+}
+
+/// Runs without network access to raw.githubusercontent.com: the glue must
+/// come from the binary.
+#[tokio::test]
+async fn embedded_glue_is_served_without_network() {
+    let harness = Harness::new();
+    let source = format!(
+        r#"
+        import {{ lodestoneVersion, getCurrentTaskPid }} from "{prelude}";
+        import * as Events from "{events}";
+        import * as IC from "{instance_control}";
+        import {{ isTServer }} from "{utils}";
+        assertEq(lodestoneVersion(), "{version}", "lodestone version");
+        // instance_control.ts re-exports getCurrentTaskPid from ../prelude/prelude.ts
+        assertEq(IC.getCurrentTaskPid(), getCurrentTaskPid(), "relative import resolved");
+        assertEq(isTServer({{ type: "GetState" }}), true, "generic glue");
+        Events.emitDetach(getCurrentTaskPid());
+        "#,
+        prelude = upstream_glue_url("src/deno_ops/prelude/prelude.ts"),
+        events = upstream_glue_url("src/deno_ops/events/events.ts"),
+        instance_control = upstream_glue_url("src/deno_ops/instance_control/instance_control.ts"),
+        utils = upstream_glue_url("src/implementations/generic/js/main/libs/utils.ts"),
+        version = VERSION.with(|v| v.to_string()),
+    );
+    let result = harness.run(&source, RunOptions::default()).await;
+    result.assert_success();
+    assert!(result.events.iter().any(|e| matches!(
+        e.try_macro_event(),
+        Some(MacroEvent {
+            macro_event_inner: MacroEventInner::Detach,
+            ..
+        })
+    )));
+}
+
+#[tokio::test]
+async fn unknown_embedded_glue_path_is_an_error() {
+    let harness = Harness::new();
+    let source = format!(
+        r#"import "{}";"#,
+        upstream_glue_url("src/deno_ops/does_not_exist.ts")
+    );
+    let result = harness.run(&source, RunOptions::default()).await;
+    let error_msg = result.error_msg();
+    assert!(
+        error_msg.contains("not part of the Lodestone glue embedded in this build"),
+        "{error_msg}"
+    );
+}
+
+/// `lodestone-macro-lib` stays remote, but its imports of the Lodestone glue
+/// are served from the embedded copies. Needs network access to
+/// raw.githubusercontent.com, so it is ignored by default.
+#[tokio::test]
+#[ignore]
+async fn macro_lib_uses_embedded_glue() {
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"
+            import { lodestoneVersion } from "https://raw.githubusercontent.com/Lodestone-Team/lodestone-macro-lib/main/prelude.ts";
+            import { ProgressionHandler } from "https://raw.githubusercontent.com/Lodestone-Team/lodestone-macro-lib/main/events.ts";
+            assertEq(typeof lodestoneVersion(), "string", "lodestoneVersion");
+            const handler = ProgressionHandler.create("from macro-lib", 10);
+            handler.complete(true, "done");
+            "#,
+            RunOptions::default(),
+        )
+        .await;
+    result.assert_success();
+}

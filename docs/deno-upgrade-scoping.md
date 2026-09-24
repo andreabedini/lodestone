@@ -1,7 +1,7 @@
 # Deno stack upgrade — scoping
 
 - **Date:** 2026-09-24
-- **Status:** scoping only, no code changed yet
+- **Status:** Phase 0 done (2026-09-24, §7); Phases 1–4 not started
 - **Related:** `docs/codebase-assessment.md` §4 Phase 3 item 13, §7.1; S1 (macro sandbox)
 
 ## 1. Summary
@@ -94,6 +94,7 @@ Total Rust surface: about 2,750 lines across 7 files.
   - The glue on upstream `dev`, and therefore `lodestone-macro-lib`, keeps working unchanged. This only works because we control the bootstrap now that `deno_runtime` is gone.
   - Ops keep their current names (`next_event`, …). Check them against deno_core's built-in op names, because duplicates panic.
 - **Embed the glue:** ship `events.ts`, `instance_control.ts`, `prelude.ts` and the generic `js/main` tree inside the binary. The module loader maps `https://raw.githubusercontent.com/Lodestone-Team/lodestone/dev/core/src/…` and `…/lodestone-macro-lib/main/…` to the embedded copies.
+  - Done in Phase 0 for the `lodestone/dev/core/` prefix (`core/build.rs`, `core/src/embedded_glue.rs`). `lodestone-macro-lib` stays remote; only its imports of the Lodestone glue are served embedded.
   - This removes a live supply-chain dependency on a repo we don't control.
   - It also decouples us from upstream's glue.
 - **Module loader:** port it from `ts_module_loader.rs`. Keep file and https; still no npm:, node: or jsr: (unchanged from today). Optionally add an on-disk cache for remote modules later.
@@ -117,14 +118,23 @@ Total Rust surface: about 2,750 lines across 7 files.
 
 ## 7. Plan
 
-**Phase 0 — prepare, on the current stack (about 2–3 days)**
+**Phase 0 — prepare, on the current stack (about 2–3 days)** — ✅ done 2026-09-24
 
-1. Add tests that run JS through `MacroExecutor` for each op category: events, instance control (against a test instance), prelude, and the procedure bridge. Also add tests for the loader (file, TS, JSON, http) and for abort.
-2. Fix the bugs found while scoping:
+1. ✅ Add tests that run JS through `MacroExecutor` for each op category: events, instance control (against a test instance), prelude, and the procedure bridge. Also add tests for the loader (file, TS, JSON, http) and for abort.
+2. ✅ Fix the bugs found while scoping:
    - `send_command` is called with 2 args from TS but takes 3 in Rust (`instance_control.ts:44`);
    - `DashMap` `Ref`s are held across `.await` in `instance_control`;
    - termination is detected by comparing error strings.
-3. Embed the glue and add the URL redirect in the current loader. This can ship on its own.
+3. ✅ Embed the glue and add the URL redirect in the current loader. This can ship on its own.
+
+Phase 0 results that matter for Phases 1–3:
+
+- The tests are in `core/src/macro_runtime_tests.rs` (plus `embedded_glue::tests`). They check only JS-visible behaviour and import the glue by `file://` or by the embedded `raw.githubusercontent.com` URL, so they need no network. They should pass unchanged after the rewrite, with one exception: the JSON import uses `assert { type: "json" }`, the only syntax `deno_ast 0.27` parses. Newer V8/`deno_ast` want `with`, so switch the test (and warn macro authors) then.
+- The tests call `Deno[Deno.internal].core.ops.*` and `core.opAsync(...)` directly in a few places (the fake atom's procedure bridge, `emit_console_out`, `next_instance_player_change`). They rely on the compat shim.
+- Termination is now a flag set by `abort_macro`/`shutdown_all`; keep that when moving to `JsRuntime`. The old text match missed an abort during module evaluation, which reports "Cannot evaluate module, because JavaScript execution has been terminated."
+- Each macro now reports exactly one `Stopped` event. Before, the executor thread always sent a second "unexpectedly panicked" error, so `get_macro_status` was wrong.
+- `__instance_uuid` is now `null` without an instance (it was the string `"null"`).
+- The procedure bridge, instance-control ops and send_command fix are tested against a real `GenericInstance` driven by a fake atom. The RCON ops are tested only for their generic-instance error; the Minecraft paths need a running server.
 
 **Phase 1 — dependencies (about 0.5 day)**
 
@@ -151,11 +161,11 @@ Total Rust surface: about 2,750 lines across 7 files.
 
 ## 8. Risks
 
-- **The Phase 0 tests are the real safety net.** Today only 2 tests exercise the runtime.
+- **The Phase 0 tests are the real safety net.** `core/src/macro_runtime_tests.rs` now has 19 runtime tests (§7; one needs network and is `#[ignore]`d); before Phase 0 only 2 tests exercised the runtime.
 - **The `deno_web` wiring is unverified.** The scratch build ran `deno_core` alone. Do a spike on it in Phase 3 before committing to the design.
 - **deno_core's embedding API still churns.** Upstream says it is "subject to rapid and breaking changes", and since the repo merge releases come with the Deno CLI. Pin exact versions and plan periodic bumps.
 - **Global op names:** a clash with a built-in op panics at startup. This shows up immediately in tests.
-- **Remote glue on upstream `dev` can change at any time.** Embedding it in Phase 0 removes that risk.
+- ~~**Remote glue on upstream `dev` can change at any time.**~~ Removed in Phase 0 by embedding it. `lodestone-macro-lib` and the `lodestone-macro-lib` import in `atom_instance.ts` are still fetched from GitHub.
 
 ## 9. References
 

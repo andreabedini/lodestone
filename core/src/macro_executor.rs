@@ -1,7 +1,7 @@
 use std::{
     fmt::{Debug, Display},
     iter::zip,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,6 +25,7 @@ use crate::{
         events::register_all_event_ops, instance_control::register_instance_control_ops,
         prelude::register_prelude_ops,
     },
+    embedded_glue,
     error::{Error, ErrorKind},
     event_broadcaster::EventBroadcaster,
     events::{CausedBy, EventInner, MacroEvent, MacroEventInner},
@@ -112,6 +113,26 @@ impl Default for TypescriptModuleLoader {
     }
 }
 
+/// How a module of `media_type` is loaded: its module type, and whether it
+/// has to be transpiled first. `None` if it cannot be loaded.
+fn module_type_of(media_type: MediaType) -> Option<(ModuleType, bool)> {
+    match media_type {
+        MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
+            Some((ModuleType::JavaScript, false))
+        }
+        MediaType::Jsx => Some((ModuleType::JavaScript, true)),
+        MediaType::TypeScript
+        | MediaType::Mts
+        | MediaType::Cts
+        | MediaType::Dts
+        | MediaType::Dmts
+        | MediaType::Dcts
+        | MediaType::Tsx => Some((ModuleType::JavaScript, true)),
+        MediaType::Json => Some((ModuleType::Json, false)),
+        _ => None,
+    }
+}
+
 impl ModuleLoader for TypescriptModuleLoader {
     fn resolve(
         &self,
@@ -131,66 +152,62 @@ impl ModuleLoader for TypescriptModuleLoader {
         let module_specifier = module_specifier.clone();
         let http = self.http.clone();
         async move {
-            let (code, module_type, media_type, should_transpile) = match module_specifier
-                .to_file_path()
+            let (code, module_type, media_type, should_transpile) = if let Some(path) =
+                embedded_glue::glue_path(module_specifier.as_str())
             {
-                Ok(path) => {
-                    let media_type = MediaType::from_path(&path);
-                    let (module_type, should_transpile) = match media_type {
-                        MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                            (ModuleType::JavaScript, false)
-                        }
-                        MediaType::Jsx => (ModuleType::JavaScript, true),
-                        MediaType::TypeScript
-                        | MediaType::Mts
-                        | MediaType::Cts
-                        | MediaType::Dts
-                        | MediaType::Dmts
-                        | MediaType::Dcts
-                        | MediaType::Tsx => (ModuleType::JavaScript, true),
-                        MediaType::Json => (ModuleType::Json, false),
-                        _ => bail!("Unknown extension {:?}", path.extension()),
-                    };
-
-                    (
-                        tokio::fs::read_to_string(&path).await?,
-                        module_type,
-                        media_type,
-                        should_transpile,
-                    )
-                }
-                Err(_) => {
-                    if module_specifier.scheme() == "http" || module_specifier.scheme() == "https" {
-                        let http_res = http.get(module_specifier.to_string()).send().await?;
-                        if !http_res.status().is_success() {
-                            bail!("Failed to fetch module: {module_specifier}");
-                        }
-                        let content_type = http_res
-                            .headers()
-                            .get("content-type")
-                            .and_then(|ct| ct.to_str().ok())
-                            .ok_or_else(|| generic_error("No content-type header"))?;
-                        let media_type =
-                            MediaType::from_content_type(&module_specifier, content_type);
-                        let (module_type, should_transpile) = match media_type {
-                            MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
-                                (ModuleType::JavaScript, false)
-                            }
-                            MediaType::Jsx => (ModuleType::JavaScript, true),
-                            MediaType::TypeScript
-                            | MediaType::Mts
-                            | MediaType::Cts
-                            | MediaType::Dts
-                            | MediaType::Dmts
-                            | MediaType::Dcts
-                            | MediaType::Tsx => (ModuleType::JavaScript, true),
-                            MediaType::Json => (ModuleType::Json, false),
-                            _ => bail!("Unknown content-type {:?}", content_type),
+                // Lodestone's own glue: serve the copy embedded in this build,
+                // never the one on GitHub.
+                let code = embedded_glue::get_glue(path).ok_or_else(|| {
+                    generic_error(format!(
+                        "{module_specifier} is not part of the Lodestone glue embedded in this build (no core/{path})"
+                    ))
+                })?;
+                let media_type = MediaType::from_path(Path::new(path));
+                let (module_type, should_transpile) = module_type_of(media_type)
+                    .ok_or_else(|| generic_error(format!("Unknown extension of {path}")))?;
+                debug!("Loading {module_specifier} from the embedded glue");
+                (code.to_string(), module_type, media_type, should_transpile)
+            } else {
+                match module_specifier.to_file_path() {
+                    Ok(path) => {
+                        let media_type = MediaType::from_path(&path);
+                        let Some((module_type, should_transpile)) = module_type_of(media_type)
+                        else {
+                            bail!("Unknown extension {:?}", path.extension());
                         };
-                        let code = http_res.text().await?;
-                        (code, module_type, media_type, should_transpile)
-                    } else {
-                        bail!("Unsupported module specifier: {}", module_specifier);
+
+                        (
+                            tokio::fs::read_to_string(&path).await?,
+                            module_type,
+                            media_type,
+                            should_transpile,
+                        )
+                    }
+                    Err(_) => {
+                        if module_specifier.scheme() == "http"
+                            || module_specifier.scheme() == "https"
+                        {
+                            let http_res = http.get(module_specifier.to_string()).send().await?;
+                            if !http_res.status().is_success() {
+                                bail!("Failed to fetch module: {module_specifier}");
+                            }
+                            let content_type = http_res
+                                .headers()
+                                .get("content-type")
+                                .and_then(|ct| ct.to_str().ok())
+                                .ok_or_else(|| generic_error("No content-type header"))?;
+                            let media_type =
+                                MediaType::from_content_type(&module_specifier, content_type);
+                            let Some((module_type, should_transpile)) =
+                                module_type_of(media_type)
+                            else {
+                                bail!("Unknown content-type {:?}", content_type);
+                            };
+                            let code = http_res.text().await?;
+                            (code, module_type, media_type, should_transpile)
+                        } else {
+                            bail!("Unsupported module specifier: {}", module_specifier);
+                        }
                     }
                 }
             };

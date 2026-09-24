@@ -80,6 +80,7 @@ mod command_console;
 pub mod db;
 mod deno_ops;
 mod docker_bridge;
+mod embedded_glue;
 pub mod error;
 mod event_broadcaster;
 mod events;

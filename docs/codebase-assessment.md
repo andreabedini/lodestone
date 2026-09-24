@@ -107,7 +107,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 
 ### Phase 3 — Dependency modernization
 
-13. **Upgrade the Deno stack** (`deno_core` / `deno_runtime` / `deno_ast`, which bring a newer `v8`). Scoped in `docs/deno-upgrade-scoping.md` (2026-09-24): target `deno_core` 0.412 without `deno_runtime`. It is no longer needed for the toolchain (§7.1), but it still clears the `deno_crypto` advisories (rsa, ring, aes-gcm, curve25519-dalek) and makes S1 easier to harden. It also lifts the old-`serde` cap (which holds `time` below its RUSTSEC-2026-0009 fix) and lets `vendor/v8` be deleted.
+13. **Upgrade the Deno stack** (`deno_core` / `deno_runtime` / `deno_ast`, which bring a newer `v8`). Scoped in `docs/deno-upgrade-scoping.md` (2026-09-24): target `deno_core` 0.412 without `deno_runtime`. Its Phase 0 is done (2026-09-24): macro runtime tests, the bugs found while scoping, and the JS glue embedded in the binary instead of fetched from upstream GitHub. It is no longer needed for the toolchain (§7.1), but it still clears the `deno_crypto` advisories (rsa, ring, aes-gcm, curve25519-dalek) and makes S1 easier to harden. It also lifts the old-`serde` cap (which holds `time` below its RUSTSEC-2026-0009 fix) and lets `vendor/v8` be deleted.
 14. Upgrade in dependency order (no longer blocked by the toolchain): `axum 0.6 → 0.7+` (router and extractor API changes; brings hyper 1 / h2 0.4 and a fixed tungstenite), Next.js 13 → 14/15, React Query 4 → 5, and Tauri 1.4 → 2.x if the desktop app is ever used.
 15. **Retire the sqlx fork**: move to upstream modern sqlx and a real migration setup (`sqlx migrate`).
 16. Resolve the dual `playit-agent` dependency to a single version.

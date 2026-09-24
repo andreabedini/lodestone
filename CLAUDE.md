@@ -21,7 +21,7 @@ Lodestone is a self-hosted manager for Minecraft / multiplayer game servers.
 # Backend (default member) — prefer `check` for fast iteration
 cargo check -p lodestone_core
 cargo build -p lodestone_core
-cargo test --no-fail-fast -- --test-threads=1   # what CI runs; ~44 unit tests, no integration tests
+cargo test --no-fail-fast -- --test-threads=1   # what CI runs; ~140 unit tests, no integration tests
 cargo clippy
 
 # Dashboard
@@ -94,3 +94,15 @@ is in `docs/codebase-assessment.md` — update it when you fix one of its items.
   maps `ErrorKind` → HTTP status. Avoid adding `.unwrap()`/`.expect()` in request
   paths (there are already ~330 in `core/src`; don't make it worse).
 - Prefer `rg` over `grep -r`.
+- **Macro JS glue is embedded.** `core/build.rs` embeds `src/deno_ops/**`,
+  `deno_bindings/` and `src/implementations/generic/js/**` into the binary, and the
+  module loader serves any `https://raw.githubusercontent.com/Lodestone-Team/lodestone/dev/core/…`
+  URL from those copies (`core/src/embedded_glue.rs`; add other branches to
+  `EMBEDDED_GLUE_URL_PREFIXES`). Editing a glue file changes what macros get, with
+  no push needed. `lodestone-macro-lib` itself is still fetched from GitHub.
+- **Macro runtime tests** live in `core/src/macro_runtime_tests.rs`. They check only
+  JS-visible behaviour (return values, events, exit status), so they must keep passing
+  across the Deno upgrade. `crate::init_test_app_state()` installs a global `AppState`
+  for tests that need `app_state()`.
+- `cargo test` regenerates the `ts-rs` bindings and touches `core/test.db`; don't
+  commit those incidental changes.

@@ -17,7 +17,11 @@ import localFont from '@next/font/local';
 config.autoAddCss = false;
 axios.defaults.timeout = 5000;
 const TRACKING_ID = 'G-LZQ3VZ6N26';
-if (process.env.NODE_ENV === 'production') ReactGA.initialize(TRACKING_ID);
+if (
+  process.env.NODE_ENV === 'production' &&
+  process.env.NEXT_PUBLIC_DISABLE_ANALYTICS !== 'true'
+)
+  ReactGA.initialize(TRACKING_ID);
 
 const contextClass = {
   default: '!bg-gray-500',

@@ -78,6 +78,9 @@ The README advertises strong sandboxing, but be aware:
 Run `cargo audit` (or cross-reference `Cargo.lock` against the RustSec advisory DB)
 before claiming the dependency tree is clean.
 
+The full assessment (security issues S1–S7, maintenance plan, latest audit results)
+is in `docs/codebase-assessment.md` — update it when you fix one of its items.
+
 ## Conventions
 
 - Errors: `thiserror` + `color-eyre`; handlers return `Result<_, error::Error>` which

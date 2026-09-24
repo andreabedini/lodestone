@@ -85,6 +85,7 @@ fn temp_dir() -> PathBuf {
 }
 
 /// Options for [`Harness::run`].
+#[derive(Default)]
 struct RunOptions {
     args: Vec<String>,
     instance_uuid: Option<InstanceUuid>,
@@ -95,18 +96,6 @@ struct RunOptions {
     feed: Vec<Event>,
     /// Abort the macro once it emits a detach event.
     abort_on_detach: bool,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self {
-            args: Vec::new(),
-            instance_uuid: None,
-            pre_injection_code: None,
-            feed: Vec::new(),
-            abort_on_detach: false,
-        }
-    }
 }
 
 struct RunResult {
@@ -185,7 +174,6 @@ impl Harness {
                 CausedBy::Unknown,
                 generator,
                 options.pre_injection_code,
-                None,
                 options.instance_uuid,
             )
             .await
@@ -256,8 +244,7 @@ async fn prelude_version_pid_and_no_instance() {
         import {{ emitDetach }} from "{events}";
         assertEq(lodestoneVersion(), "{version}", "lodestone version");
         assertEq(typeof getCurrentTaskPid(), "number", "task pid type");
-        // BUG: without an instance the injected uuid is the string "null".
-        assertEq(getCurrentInstanceUUID(), "null", "instance uuid without an instance");
+        assertEq(getCurrentInstanceUUID(), null, "instance uuid without an instance");
         // report our pid back to the host
         emitDetach(getCurrentTaskPid());
         "#,
@@ -720,6 +707,9 @@ async fn instance_control_with_generic_instance() {
             {{ type: "KillInstance", caused_by: me }},
         ], "server calls carry the task pid");
 
+        await IC.sendCommand("say hi", uuid);
+        assertEq((await fake()).lastCommand, {{ type: "SendCommand", command: "say hi", caused_by: me }}, "sendCommand");
+
         assertEq((await IC.monitorInstance(uuid)).cpu_usage, 1.5, "monitor");
         assertEq(await IC.getInstancePlayerCount(uuid), 1, "player count");
         assertEq(await IC.getInstanceMaxPlayers(uuid), 20, "max players");
@@ -850,12 +840,8 @@ async fn abort_busy_loop_during_module_evaluation() {
             },
         )
         .await;
-    // BUG: the termination is detected by matching the error text, and the
-    // text differs here, so the abort is reported as an error.
     assert!(
-        result
-            .error_msg()
-            .contains("JavaScript execution has been terminated"),
+        matches!(result.exit_status, ExitStatus::Killed { .. }),
         "{:?}",
         result.exit_status
     );
@@ -906,4 +892,49 @@ async fn abort_unknown_pid_is_not_found() {
         matches!(err.kind, crate::error::ErrorKind::NotFound),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn error_that_looks_like_termination_is_an_error() {
+    // A macro can throw an error whose text matches a termination. It must
+    // still be reported as an error, not as killed.
+    let harness = Harness::new();
+    let result = harness
+        .run(
+            r#"
+            const e = new Error("execution terminated");
+            e.stack = "Error: execution terminated";
+            throw e;
+            "#,
+            RunOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(result.exit_status, ExitStatus::Error { .. }),
+        "{:?}",
+        result.exit_status
+    );
+}
+
+#[tokio::test]
+async fn macro_status_is_the_reported_exit_status() {
+    // The executor thread must not report a second, spurious exit status
+    // after the macro has stopped.
+    let harness = Harness::new();
+    let result = harness
+        .run("console.log('done');", RunOptions::default())
+        .await;
+    result.assert_success();
+    let status = tokio::time::timeout(RUN_TIMEOUT, async {
+        loop {
+            // give a spurious second event time to arrive
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(status) = harness.executor.get_macro_status(result.pid).await {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("macro status was never recorded");
+    assert!(matches!(status, ExitStatus::Success { .. }), "{status:?}");
 }

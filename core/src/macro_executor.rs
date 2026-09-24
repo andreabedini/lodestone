@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -12,7 +12,7 @@ use std::{
 
 use color_eyre::eyre::Context;
 use dashmap::DashMap;
-use deno_runtime::permissions::{Permissions, PermissionsOptions};
+use deno_runtime::permissions::Permissions;
 use futures_util::Future;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,9 +215,25 @@ impl ModuleLoader for TypescriptModuleLoader {
     }
 }
 
+/// Handle to a running macro, used to abort it from another thread.
+#[derive(Debug)]
+struct MacroHandle {
+    isolate_handle: deno_core::v8::IsolateHandle,
+    /// Set before the isolate is terminated, so that the macro thread can tell
+    /// an abort apart from an error thrown by the macro.
+    aborted: Arc<AtomicBool>,
+}
+
+impl MacroHandle {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.isolate_handle.terminate_execution();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MacroExecutor {
-    macro_process_table: Arc<DashMap<MacroPID, deno_core::v8::IsolateHandle>>,
+    macro_process_table: Arc<DashMap<MacroPID, MacroHandle>>,
     exit_status_table: Arc<DashMap<MacroPID, ExitStatus>>,
     #[allow(dead_code)]
     channel_table:
@@ -269,28 +285,6 @@ impl MacroExecutor {
         }
     }
 
-    fn add_default_permissions(
-        perm: Option<PermissionsOptions>,
-        path_to_main: PathBuf,
-    ) -> PermissionsOptions {
-        let parent = path_to_main.parent().unwrap().to_path_buf();
-        if let Some(mut perm) = perm {
-            perm.allow_read
-                .get_or_insert_with(std::vec::Vec::new)
-                .push(parent.clone());
-            perm.allow_write
-                .get_or_insert_with(std::vec::Vec::new)
-                .push(parent);
-            perm
-        } else {
-            PermissionsOptions {
-                allow_read: Some(vec![parent.clone()]),
-                allow_write: Some(vec![parent]),
-                ..Default::default()
-            }
-        }
-    }
-
     /// For timeout:
     ///
     /// If `None`, the handle will never timeout.
@@ -308,7 +302,6 @@ impl MacroExecutor {
         _caused_by: CausedBy,
         worker_options_generator: Box<dyn WorkerOptionGenerator>,
         pre_injection_code: Option<String>,
-        permissions: Option<PermissionsOptions>,
         instance_uuid: Option<InstanceUuid>,
     ) -> Result<SpawnResult, Error> {
         let pid = MacroPID(self.next_process_id.fetch_add(1, Ordering::SeqCst));
@@ -335,9 +328,12 @@ impl MacroExecutor {
             move || {
                 let _guard = rt.enter();
                 let local = LocalSet::new();
+                // whether the macro task reported its own exit status
+                let stopped_sent = Arc::new(AtomicBool::new(false));
                 local.spawn_local({
                     let event_broadcaster = event_broadcaster.clone();
                     let instance_uuid = instance_uuid.clone();
+                    let stopped_sent = stopped_sent.clone();
                     async move {
                         let mut worker_option = worker_options_generator.generate();
                         worker_option.get_error_class_fn = Some(&deno_errors::get_error_class_name);
@@ -357,17 +353,19 @@ impl MacroExecutor {
                             args,
                             ..Default::default()
                         });
+                        // `null` (not the string "null") when there is no instance
+                        let instance_uuid_js = match &instance_uuid {
+                            Some(uuid) => serde_json::to_string(uuid.as_ref())
+                                .unwrap_or_else(|_| "null".to_string()),
+                            None => "null".to_string(),
+                        };
                         main_worker
                             .execute_script(
                                 "deps_inject",
                                 deno_core::FastString::Owned(
                                     format!(
-                                        "const __macro_pid = {}; const __instance_uuid = \"{}\";",
-                                        pid.0,
-                                        instance_uuid
-                                            .clone()
-                                            .map(|uuid| uuid.to_string())
-                                            .unwrap_or_else(|| "null".to_string())
+                                        "const __macro_pid = {}; const __instance_uuid = {};",
+                                        pid.0, instance_uuid_js
                                     )
                                     .into_boxed_str(),
                                 ),
@@ -380,10 +378,33 @@ impl MacroExecutor {
                                 .unwrap();
                         }
 
-                        let isolate_handle =
-                            main_worker.js_runtime.v8_isolate().thread_safe_handle();
+                        let aborted = Arc::new(AtomicBool::new(false));
+                        process_table.insert(
+                            pid,
+                            MacroHandle {
+                                isolate_handle: main_worker
+                                    .js_runtime
+                                    .v8_isolate()
+                                    .thread_safe_handle(),
+                                aborted: aborted.clone(),
+                            },
+                        );
 
-                        process_table.insert(pid, isolate_handle);
+                        // An error after an abort is the termination itself,
+                        // not a failure of the macro.
+                        let exit_status_on_error = |e: &anyhow::Error| {
+                            if aborted.load(Ordering::SeqCst) {
+                                warn!("User terminated macro execution");
+                                ExitStatus::Killed {
+                                    time: chrono::Utc::now().timestamp(),
+                                }
+                            } else {
+                                ExitStatus::Error {
+                                    error_msg: e.to_string(),
+                                    time: chrono::Utc::now().timestamp(),
+                                }
+                            }
+                        };
 
                         let main_module = match deno_core::resolve_path(
                             &path_to_main_module.to_string_lossy(),
@@ -405,83 +426,37 @@ impl MacroExecutor {
                             .into(),
                         );
 
-                        if let Err(e) = main_worker.execute_main_module(&main_module).await {
-                            if e.to_string() == "Uncaught Error: execution terminated" {
-                                warn!("User terminated macro execution");
-                                event_broadcaster.send(
-                                    MacroEvent {
-                                        macro_pid: pid,
-                                        macro_event_inner: MacroEventInner::Stopped {
-                                            exit_status: ExitStatus::Killed {
-                                                time: chrono::Utc::now().timestamp(),
-                                            },
-                                        },
-                                        instance_uuid,
-                                    }
-                                    .into(),
-                                );
-                            } else {
-                                error!("Error executing main module {main_module}: {}", e);
-                                event_broadcaster.send(
-                                    MacroEvent {
-                                        macro_pid: pid,
-                                        macro_event_inner: MacroEventInner::Stopped {
-                                            exit_status: ExitStatus::Error {
-                                                error_msg: e.to_string(),
-                                                time: chrono::Utc::now().timestamp(),
-                                            },
-                                        },
-                                        instance_uuid,
-                                    }
-                                    .into(),
-                                );
+                        let exit_status = match main_worker.execute_main_module(&main_module).await
+                        {
+                            Err(e) => {
+                                let exit_status = exit_status_on_error(&e);
+                                if !matches!(exit_status, ExitStatus::Killed { .. }) {
+                                    error!("Error executing main module {main_module}: {}", e);
+                                }
+                                exit_status
                             }
-                            return;
-                        }
-
-                        if let Err(e) = main_worker.run_event_loop(false).await {
-                            if e.to_string() == "Uncaught Error: execution terminated" {
-                                warn!("User terminated macro execution");
-                                event_broadcaster.send(
-                                    MacroEvent {
-                                        macro_pid: pid,
-                                        macro_event_inner: MacroEventInner::Stopped {
-                                            exit_status: ExitStatus::Killed {
-                                                time: chrono::Utc::now().timestamp(),
-                                            },
-                                        },
-                                        instance_uuid: instance_uuid.clone(),
+                            Ok(()) => match main_worker.run_event_loop(false).await {
+                                Err(e) => {
+                                    let exit_status = exit_status_on_error(&e);
+                                    if !matches!(exit_status, ExitStatus::Killed { .. }) {
+                                        error!("Error running event loops: {}", e);
                                     }
-                                    .into(),
-                                );
-                            } else {
-                                error!("Error running event loops: {}", e);
-                                event_broadcaster.send(
-                                    MacroEvent {
-                                        macro_pid: pid,
-                                        macro_event_inner: MacroEventInner::Stopped {
-                                            exit_status: ExitStatus::Error {
-                                                error_msg: e.to_string(),
-                                                time: chrono::Utc::now().timestamp(),
-                                            },
-                                        },
-                                        instance_uuid: instance_uuid.clone(),
+                                    exit_status
+                                }
+                                Ok(()) => {
+                                    debug!("Macro event loop exited");
+                                    ExitStatus::Success {
+                                        time: chrono::Utc::now().timestamp(),
                                     }
-                                    .into(),
-                                );
-                            }
-                        }
+                                }
+                            },
+                        };
 
-                        debug!("Macro event loop exited");
-
+                        stopped_sent.store(true, Ordering::SeqCst);
                         event_broadcaster.send(
                             MacroEvent {
                                 macro_pid: pid,
-                                macro_event_inner: MacroEventInner::Stopped {
-                                    exit_status: ExitStatus::Success {
-                                        time: chrono::Utc::now().timestamp(),
-                                    },
-                                },
+                                macro_event_inner: MacroEventInner::Stopped { exit_status },
                                 instance_uuid,
                             }
                             .into(),
@@ -496,6 +471,9 @@ impl MacroExecutor {
                 // spawned tasks have returned.
                 rt.block_on(local);
                 debug!("MacroExecutor thread exited");
+                if stopped_sent.load(Ordering::SeqCst) {
+                    return;
+                }
                 event_broadcaster.send(
                     MacroEvent {
                         macro_pid: pid,
@@ -556,7 +534,7 @@ impl MacroExecutor {
                 kind: ErrorKind::NotFound,
                 source: eyre!("Macro with pid {} not found", pid),
             })?
-            .terminate_execution();
+            .abort();
         Ok(())
     }
 
@@ -617,7 +595,7 @@ impl MacroExecutor {
 
     pub fn shutdown_all(&self) {
         for element in self.macro_process_table.iter() {
-            element.value().terminate_execution();
+            element.value().abort();
         }
     }
 }
@@ -1055,7 +1033,6 @@ mod tests {
                 Box::new(basic_worker_generator),
                 None,
                 None,
-                None,
             )
             .await
             .unwrap();
@@ -1095,7 +1072,6 @@ mod tests {
                 Vec::new(),
                 CausedBy::Unknown,
                 Box::new(basic_worker_generator),
-                None,
                 None,
                 None,
             )

@@ -160,7 +160,6 @@ impl TMacro for MinecraftInstance {
                 caused_by,
                 Box::new(DefaultWorkerOptionGenerator),
                 config_code,
-                None,
                 Some(self.uuid.clone()),
             )
             .await?;

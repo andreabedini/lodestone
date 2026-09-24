@@ -64,7 +64,6 @@ impl TServer for MinecraftInstance {
                     CausedBy::System,
                     Box::new(DefaultWorkerOptionGenerator),
                     None,
-                    None,
                     Some(self.uuid.clone()),
                 )
                 .await;

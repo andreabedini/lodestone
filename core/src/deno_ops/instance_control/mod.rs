@@ -8,7 +8,7 @@ use deno_core::{
 use crate::{
     events::CausedBy,
     macro_executor::MacroPID,
-    prelude::app_state,
+    prelude::{app_state, GameInstance},
     traits::{
         t_configurable::{Game, TConfigurable},
         t_player::{Player, TPlayerManagement},
@@ -16,6 +16,20 @@ use crate::{
     },
     types::InstanceUuid,
 };
+
+/// Clone the instance out of the map, so that no `DashMap` guard is held
+/// across an `.await` (that would block writers to the same shard, e.g.
+/// instance creation or deletion, for as long as the op runs).
+///
+/// `GameInstance` is a handle: its state lives behind `Arc`s, so the clone is
+/// cheap and shares state with the entry in the map.
+fn get_instance(instance_uuid: &InstanceUuid) -> Result<GameInstance, anyhow::Error> {
+    app_state()
+        .instances
+        .get(instance_uuid)
+        .map(|entry| entry.value().clone())
+        .ok_or_else(|| anyhow::anyhow!("Instance not found"))
+}
 
 #[op]
 fn instance_exists(instance_uuid: InstanceUuid) -> bool {
@@ -37,10 +51,7 @@ async fn start_instance(
     task_pid: MacroPID,
     block: bool,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     instance
         .start(
             CausedBy::Macro {
@@ -58,10 +69,7 @@ async fn stop_instance(
     task_pid: MacroPID,
     block: bool,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     instance
         .stop(
             CausedBy::Macro {
@@ -70,7 +78,7 @@ async fn stop_instance(
             block,
         )
         .await
-        .context("Failed to start instance")
+        .context("Failed to stop instance")
 }
 
 #[op]
@@ -79,10 +87,7 @@ async fn restart_instance(
     task_pid: MacroPID,
     block: bool,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     instance
         .restart(
             CausedBy::Macro {
@@ -91,7 +96,7 @@ async fn restart_instance(
             block,
         )
         .await
-        .context("Failed to start instance")
+        .context("Failed to restart instance")
 }
 
 #[op]
@@ -99,24 +104,18 @@ async fn kill_instance(
     instance_uuid: InstanceUuid,
     task_pid: MacroPID,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     instance
         .kill(CausedBy::Macro {
             macro_pid: task_pid,
         })
         .await
-        .context("Failed to start instance")
+        .context("Failed to kill instance")
 }
 
 #[op]
 async fn get_instance_state(instance_uuid: InstanceUuid) -> Result<State, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
 
     Ok(instance.state().await)
 }
@@ -127,10 +126,7 @@ async fn send_command(
     command: String,
     task_pid: MacroPID,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     instance
         .send_command(
             &command,
@@ -139,33 +135,24 @@ async fn send_command(
             },
         )
         .await
-        .context("Failed to start instance")
+        .context("Failed to send command")
 }
 
 #[op]
 async fn monitor_instance(instance_uuid: InstanceUuid) -> Result<MonitorReport, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.monitor().await)
 }
 
 #[op]
 async fn get_instance_player_count(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.get_player_count().await?)
 }
 
 #[op]
 async fn get_instance_max_players(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.get_max_player_count().await?)
 }
 
@@ -173,73 +160,49 @@ async fn get_instance_max_players(instance_uuid: InstanceUuid) -> Result<u32, an
 async fn get_instance_player_list(
     instance_uuid: InstanceUuid,
 ) -> Result<HashSet<Player>, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.get_player_list().await?)
 }
 
 #[op]
 async fn get_instance_name(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.name().await)
 }
 
 #[op]
 async fn get_instance_game(instance_uuid: InstanceUuid) -> Result<Game, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.game_type().await)
 }
 
 #[op]
 async fn get_instance_game_version(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.version().await)
 }
 
 #[op]
 async fn get_instance_description(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.description().await)
 }
 
 #[op]
 async fn get_instance_port(instance_uuid: InstanceUuid) -> Result<u32, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.port().await)
 }
 
 #[op]
 async fn get_instance_path(instance_uuid: InstanceUuid) -> Result<String, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
     Ok(instance.path().await.to_string_lossy().to_string())
 }
 
 #[op]
 async fn set_instance_name(instance_uuid: InstanceUuid, name: String) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
 
     instance
         .set_name(name)
@@ -252,10 +215,7 @@ async fn set_instance_description(
     instance_uuid: InstanceUuid,
     description: String,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
 
     instance
         .set_description(description)
@@ -265,10 +225,7 @@ async fn set_instance_description(
 
 #[op]
 async fn set_instance_port(instance_uuid: InstanceUuid, port: u32) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
 
     instance
         .set_port(port)
@@ -281,10 +238,7 @@ async fn set_instance_auto_start(
     instance_uuid: InstanceUuid,
     auto_start: bool,
 ) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
+    let instance = get_instance(&instance_uuid)?;
 
     instance
         .set_auto_start(auto_start)
@@ -294,15 +248,10 @@ async fn set_instance_auto_start(
 
 #[op]
 async fn is_rcon_available(instance_uuid: InstanceUuid) -> Result<bool, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
-    match instance.value() {
-        crate::prelude::GameInstance::MinecraftInstance(v) => {
-            Ok(v.get_rcon().lock().await.is_some())
-        }
-        crate::prelude::GameInstance::GenericInstance(_) => {
+    let instance = get_instance(&instance_uuid)?;
+    match &instance {
+        GameInstance::MinecraftInstance(v) => Ok(v.get_rcon().lock().await.is_some()),
+        GameInstance::GenericInstance(_) => {
             bail!("RCON not available for atom instances")
         }
     }
@@ -313,13 +262,10 @@ async fn try_send_rcon_command(
     instance_uuid: InstanceUuid,
     command: String,
 ) -> Result<Option<String>, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
-    match instance.value() {
-        crate::prelude::GameInstance::MinecraftInstance(v) => Ok(v.send_rcon(&command).await.ok()),
-        crate::prelude::GameInstance::GenericInstance(_) => {
+    let instance = get_instance(&instance_uuid)?;
+    match &instance {
+        GameInstance::MinecraftInstance(v) => Ok(v.send_rcon(&command).await.ok()),
+        GameInstance::GenericInstance(_) => {
             bail!("RCON not available for atom instances")
         }
     }
@@ -330,12 +276,9 @@ async fn send_rcon_command(
     instance_uuid: InstanceUuid,
     command: String,
 ) -> Result<String, anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
-    match instance.value() {
-        crate::prelude::GameInstance::MinecraftInstance(v) => {
+    let instance = get_instance(&instance_uuid)?;
+    match &instance {
+        GameInstance::MinecraftInstance(v) => {
             let rcon = v.get_rcon();
             loop {
                 if let Some(rcon) = rcon.lock().await.as_mut() {
@@ -344,7 +287,7 @@ async fn send_rcon_command(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        crate::prelude::GameInstance::GenericInstance(_) => {
+        GameInstance::GenericInstance(_) => {
             bail!("RCON not available for atom instances")
         }
     }
@@ -352,12 +295,9 @@ async fn send_rcon_command(
 
 #[op]
 async fn wait_till_rcon_available(instance_uuid: InstanceUuid) -> Result<(), anyhow::Error> {
-    let instance = app_state()
-        .instances
-        .get(&instance_uuid)
-        .ok_or(anyhow::anyhow!("Instance not found"))?;
-    match instance.value() {
-        crate::prelude::GameInstance::MinecraftInstance(v) => {
+    let instance = get_instance(&instance_uuid)?;
+    match &instance {
+        GameInstance::MinecraftInstance(v) => {
             let rcon = v.get_rcon();
             loop {
                 if rcon.lock().await.is_some() {
@@ -366,7 +306,7 @@ async fn wait_till_rcon_available(instance_uuid: InstanceUuid) -> Result<(), any
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        crate::prelude::GameInstance::GenericInstance(_) => {
+        GameInstance::GenericInstance(_) => {
             bail!("RCON not available for atom instances")
         }
     }

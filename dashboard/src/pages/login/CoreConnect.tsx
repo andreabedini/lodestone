@@ -1,7 +1,14 @@
 import axios from 'axios';
 import Button from 'components/Atoms/Button';
 import { useContext } from 'react';
-import { DISABLE_AUTOFILL, errorToString, LODESTONE_PORT, asset } from 'utils/util';
+import {
+  DEFAULT_LOCAL_CORE,
+  DISABLE_AUTOFILL,
+  errorToString,
+  LODESTONE_PORT,
+  SAME_ORIGIN_CORE,
+  asset,
+} from 'utils/util';
 import { CoreConnectionInfo, LodestoneContext } from 'data/LodestoneContext';
 import InputField from 'components/Atoms/Form/InputField';
 import { Form, Formik, FormikHelpers } from 'formik';
@@ -36,9 +43,9 @@ const CoreConnect = () => {
 
   const initialValues: CoreConnectionInfo = {
     address: '',
-    port: LODESTONE_PORT.toString(),
+    port: SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.port : LODESTONE_PORT.toString(),
     apiVersion: 'v1',
-    protocol: 'http',
+    protocol: SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.protocol : 'http',
   };
 
   const onSubmit = (

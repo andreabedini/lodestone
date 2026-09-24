@@ -19,7 +19,12 @@ import React, {
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useLocalStorage } from 'usehooks-ts';
 import { useLocalStorageQueryParam } from 'utils/hooks';
-import { DEFAULT_LOCAL_CORE, errorToString, LODESTONE_PORT } from 'utils/util';
+import {
+  DEFAULT_LOCAL_CORE,
+  errorToString,
+  LODESTONE_PORT,
+  SAME_ORIGIN_CORE,
+} from 'utils/util';
 import Dashboard from 'pages/dashboard';
 import Home from 'pages/home';
 import axios from 'axios';
@@ -37,6 +42,7 @@ import { BrowserLocationContext } from 'data/BrowserLocationContext';
 import NotFound from 'pages/notfound';
 import FirstTime from 'pages/login/FirstTime';
 import RequireCore from 'utils/router/RequireCore';
+import MyNavigate from 'utils/router/MyNavigate';
 import RequireToken from 'utils/router/RequireToken';
 import { InstanceViewLayout } from 'components/DashboardLayout/InstanceViewLayout';
 import { SettingsLayout } from 'components/DashboardLayout/SettingsLayout';
@@ -93,22 +99,33 @@ export default function App() {
   const { location, setSearchParam } = useContext(BrowserLocationContext);
 
   /* Start Core */
-  const [address, setAddress] = useLocalStorageQueryParam(
+  const [storedAddress, setAddress] = useLocalStorageQueryParam(
     'address',
     DEFAULT_LOCAL_CORE.address
   );
-  const [port, setPort] = useLocalStorageQueryParam(
+  const [storedPort, setPort] = useLocalStorageQueryParam(
     'port',
     DEFAULT_LOCAL_CORE.port
   );
-  const [protocol, setProtocol] = useLocalStorageQueryParam(
+  const [storedProtocol, setProtocol] = useLocalStorageQueryParam(
     'protocol',
     DEFAULT_LOCAL_CORE.protocol
   );
-  const [apiVersion, setApiVersion] = useLocalStorageQueryParam(
+  const [storedApiVersion, setApiVersion] = useLocalStorageQueryParam(
     'apiVersion',
     DEFAULT_LOCAL_CORE.apiVersion
   );
+  // Served next to its core, the dashboard always talks to that core:
+  // a core remembered in localStorage or passed as a query parameter
+  // (e.g. an old address:16662) must not override it.
+  const address = SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.address : storedAddress;
+  const port = SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.port : storedPort;
+  const protocol = SAME_ORIGIN_CORE
+    ? DEFAULT_LOCAL_CORE.protocol
+    : storedProtocol;
+  const apiVersion = SAME_ORIGIN_CORE
+    ? DEFAULT_LOCAL_CORE.apiVersion
+    : storedApiVersion;
   const core: CoreConnectionInfo = useMemo(
     () => ({
       address,
@@ -262,18 +279,32 @@ export default function App() {
           }}
         >
           <Routes>
-            <Route element={<LoginLayout />}>
-              <Route path="/first_setup" element={<FirstTime />} />
-              <Route
-                path="/login/core/select"
-                element={
-                  <RequireCore redirect="/login/core/new">
-                    <CoreSelectExisting />
-                  </RequireCore>
-                }
-              />
-              <Route path="/login/core/new" element={<CoreConnect />} />
-            </Route>
+            {SAME_ORIGIN_CORE ? (
+              // No core to choose: the dashboard only ever talks to the core
+              // on its own origin. Old links land on the user login instead.
+              ['/first_setup', '/login/core/select', '/login/core/new'].map(
+                (path) => (
+                  <Route
+                    key={path}
+                    path={path}
+                    element={<MyNavigate to="/login/user/select" />}
+                  />
+                )
+              )
+            ) : (
+              <Route element={<LoginLayout />}>
+                <Route path="/first_setup" element={<FirstTime />} />
+                <Route
+                  path="/login/core/select"
+                  element={
+                    <RequireCore redirect="/login/core/new">
+                      <CoreSelectExisting />
+                    </RequireCore>
+                  }
+                />
+                <Route path="/login/core/new" element={<CoreConnect />} />
+              </Route>
+            )}
             <Route
               element={
                 <RequireCore>

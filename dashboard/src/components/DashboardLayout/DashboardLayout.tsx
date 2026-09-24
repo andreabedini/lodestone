@@ -9,7 +9,7 @@ import { BrowserLocationContext } from 'data/BrowserLocationContext';
 import { Outlet } from 'react-router-dom';
 import ConfirmDialog from 'components/Atoms/ConfirmDialog';
 import { Popover } from '@headlessui/react';
-import { DEFAULT_LOCAL_CORE } from 'utils/util';
+import { DEFAULT_LOCAL_CORE, SAME_ORIGIN_CORE } from 'utils/util';
 import { LodestoneContext } from 'data/LodestoneContext';
 import { major, minor, patch, valid, eq } from 'semver';
 import { toast } from 'react-toastify';
@@ -172,9 +172,9 @@ export default function DashboardLayout() {
           setPathname('/login/core/first_setup');
           setShowSetupPrompt(false);
         }}
-        closeButtonText="Change Core"
+        closeButtonText={SAME_ORIGIN_CORE ? 'Later' : 'Change Core'}
         onClose={() => {
-          setPathname('/login/core/select');
+          if (!SAME_ORIGIN_CORE) setPathname('/login/core/select');
           setShowSetupPrompt(false);
         }}
       >
@@ -186,9 +186,12 @@ export default function DashboardLayout() {
         title="Core Connection Error"
         type="info"
         z-index="20"
-        confirmButtonText="Back to Core selection"
+        confirmButtonText={
+          SAME_ORIGIN_CORE ? 'Retry' : 'Back to Core selection'
+        }
         onConfirm={() => {
-          setPathname('/login/core/select');
+          if (SAME_ORIGIN_CORE) window.location.reload();
+          else setPathname('/login/core/select');
         }}
         closeButtonText="Continue with current Core"
         onClose={() => {

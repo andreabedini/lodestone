@@ -15,7 +15,7 @@ import Avatar from 'components/Atoms/Avatar';
 import { useDocumentTitle, useEffectOnce } from 'usehooks-ts';
 import { tauri } from 'utils/tauriUtil';
 import { JwtToken } from 'bindings/JwtToken';
-import { isLocalCore, asset } from 'utils/util';
+import { isLocalCore, asset, SAME_ORIGIN_CORE } from 'utils/util';
 
 const UserSelectExisting = () => {
   useDocumentTitle('Select user - Lodestone');
@@ -89,14 +89,16 @@ const UserSelectExisting = () => {
           onClick={() => setPathname('/login/user')}
         />
       </div>
-      <div className="flex w-full flex-row justify-start gap-4">
-        <Button
-          type="button"
-          icon={faArrowLeft}
-          label="Change Core"
-          onClick={() => setPathname('/login/core/select')}
-        />
-      </div>
+      {!SAME_ORIGIN_CORE && (
+        <div className="flex w-full flex-row justify-start gap-4">
+          <Button
+            type="button"
+            icon={faArrowLeft}
+            label="Change Core"
+            onClick={() => setPathname('/login/core/select')}
+          />
+        </div>
+      )}
     </div>
   );
 };

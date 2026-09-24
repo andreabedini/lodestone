@@ -1,4 +1,4 @@
-import { getSnowflakeTimestamp, LODESTONE_PORT } from './../utils/util';
+import { getSnowflakeTimestamp } from './../utils/util';
 import { InstanceEvent } from './../bindings/InstanceEvent';
 import { match, otherwise } from 'variant';
 import { useUserAuthorized } from 'data/UserInfo';
@@ -122,9 +122,7 @@ export const useConsoleStream = (uuid: string) => {
 
     try {
       const websocket = new WebSocket(
-        `${protocol === 'https' ? 'wss' : 'ws'}://${address}:${
-          port ?? LODESTONE_PORT
-        }/api/${apiVersion}/instance/${uuid}/console/stream?token=Bearer ${token}`
+        `${protocol === 'https' ? 'wss' : 'ws'}://${address}:${port}/api/${apiVersion}/instance/${uuid}/console/stream?token=Bearer ${token}`
       );
 
       websocket.onopen = () => {

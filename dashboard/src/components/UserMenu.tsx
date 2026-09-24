@@ -15,7 +15,6 @@ import {
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import IconButton from './Atoms/IconButton';
 import { useLocation } from 'react-router-dom';
-import { SAME_ORIGIN_CORE } from 'utils/util';
 
 export type UserState = 'loading' | 'logged-in' | 'logged-out';
 
@@ -96,25 +95,6 @@ const UserMenu = () => {
                 )}
               </Menu.Item>
 
-              {!SAME_ORIGIN_CORE && (
-                <Menu.Item>
-                  {({ disabled }) => (
-                    <Button
-                      className="w-full flex-nowrap whitespace-nowrap"
-                      label="Change core"
-                      iconRight={faArrowRightArrowLeft}
-                      align="between"
-                      disabled={disabled}
-                      onClick={() => {
-                        setSearchParam('instance', undefined);
-                        setSearchParam('user', undefined);
-                        setPathname('/login/core/select');
-                      }}
-                      variant="text"
-                    />
-                  )}
-                </Menu.Item>
-              )}
             </div>
           </Menu.Items>
         </Transition>

@@ -9,30 +9,16 @@ import {
   useNotificationReducer,
   useOngoingNotificationReducer,
 } from 'data/NotificationContext';
-import React, {
-  useContext,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useState,
-} from 'react';
+import React, { useContext, useLayoutEffect, useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useLocalStorage } from 'usehooks-ts';
-import { useLocalStorageQueryParam } from 'utils/hooks';
-import {
-  DEFAULT_LOCAL_CORE,
-  errorToString,
-  LODESTONE_PORT,
-  SAME_ORIGIN_CORE,
-} from 'utils/util';
+import { CORE, errorToString } from 'utils/util';
 import Dashboard from 'pages/dashboard';
 import Home from 'pages/home';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import DashboardLayout from 'components/DashboardLayout';
 import SettingsPage from 'pages/settings';
-import CoreSelectExisting from 'pages/login/CoreSelectExisting';
-import CoreConnect from 'pages/login/CoreConnect';
 import UserSelectExisting from 'pages/login/UserSelectExisting';
 import UserLogin from 'pages/login/UserLogin';
 import CoreSetupNew from 'pages/login/CoreSetupNew';
@@ -40,9 +26,6 @@ import CoreConfigNew from 'pages/login/CoreConfigNew';
 import LoginLayout from 'components/LoginLayout';
 import { BrowserLocationContext } from 'data/BrowserLocationContext';
 import NotFound from 'pages/notfound';
-import FirstTime from 'pages/login/FirstTime';
-import RequireCore from 'utils/router/RequireCore';
-import MyNavigate from 'utils/router/MyNavigate';
 import RequireToken from 'utils/router/RequireToken';
 import { InstanceViewLayout } from 'components/DashboardLayout/InstanceViewLayout';
 import { SettingsLayout } from 'components/DashboardLayout/SettingsLayout';
@@ -96,108 +79,20 @@ export const AccountSettingsTabList = [
 ];
 
 export default function App() {
-  const { location, setSearchParam } = useContext(BrowserLocationContext);
+  const { location } = useContext(BrowserLocationContext);
 
   /* Start Core */
-  const [storedAddress, setAddress] = useLocalStorageQueryParam(
-    'address',
-    DEFAULT_LOCAL_CORE.address
-  );
-  const [storedPort, setPort] = useLocalStorageQueryParam(
-    'port',
-    DEFAULT_LOCAL_CORE.port
-  );
-  const [storedProtocol, setProtocol] = useLocalStorageQueryParam(
-    'protocol',
-    DEFAULT_LOCAL_CORE.protocol
-  );
-  const [storedApiVersion, setApiVersion] = useLocalStorageQueryParam(
-    'apiVersion',
-    DEFAULT_LOCAL_CORE.apiVersion
-  );
-  // Served next to its core, the dashboard always talks to that core:
-  // a core remembered in localStorage or passed as a query parameter
-  // (e.g. an old address:16662) must not override it.
-  const address = SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.address : storedAddress;
-  const port = SAME_ORIGIN_CORE ? DEFAULT_LOCAL_CORE.port : storedPort;
-  const protocol = SAME_ORIGIN_CORE
-    ? DEFAULT_LOCAL_CORE.protocol
-    : storedProtocol;
-  const apiVersion = SAME_ORIGIN_CORE
-    ? DEFAULT_LOCAL_CORE.apiVersion
-    : storedApiVersion;
-  const core: CoreConnectionInfo = useMemo(
-    () => ({
-      address,
-      port,
-      protocol,
-      apiVersion,
-    }),
-    [address, port, protocol, apiVersion]
-  );
-  const socket = useMemo(() => `${address}:${port}`, [address, port]);
-  const [coreList, setCoreList] = useLocalStorage<CoreConnectionInfo[]>(
-    'cores',
-    []
-  );
+  // Always the core on this origin (see CORE in utils/util): REST calls go to
+  // /api/v1 on the same host, websockets to the same host and port.
+  const core: CoreConnectionInfo = CORE;
+  const { address, port, apiVersion } = core;
+  const socket = `${address}:${port}`;
   const [coreConnectionStatus, setCoreConnectionStatus] =
     useState<CoreConnectionStatus>('loading');
-  const setCore = (c: CoreConnectionInfo) => {
-    queryClient.invalidateQueries();
-    queryClient.clear();
-    setSearchParam('instance', undefined);
-    //TODO: add core to the key of each query instead of invalidating all queries
-    setAddress(c.address);
-    setPort(c.port.toString());
-    setProtocol(c.protocol);
-    setApiVersion(c.apiVersion);
-  };
-
-  useEffect(() => {
-    // we only want to add successful cores to the list
-    if (coreConnectionStatus !== 'success') return;
-    // check if core is already in the list
-    // if it's exactly the same, do nothing
-    if (
-      coreList.some(
-        (c) =>
-          c.address === address &&
-          c.port === port &&
-          c.protocol === protocol &&
-          c.apiVersion === apiVersion
-      )
-    )
-      return;
-    const index = coreList.findIndex(
-      (c) => c.address === address && c.port === port
-    );
-    if (index !== -1) {
-      const newCoreList = [...coreList];
-      newCoreList[index] = core;
-      setCoreList(newCoreList);
-    } else {
-      setCoreList([...coreList, core]);
-    }
-
-    // core and corelist left out on purpose
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address, apiVersion, core, port, protocol, coreConnectionStatus]);
   useLayoutEffect(() => {
-    axios.defaults.baseURL = `${protocol}://${socket}/api/${apiVersion}`;
+    axios.defaults.baseURL = `/api/${apiVersion}`;
     setCoreConnectionStatus('loading');
-  }, [apiVersion, protocol, socket]);
-
-  // Add the core to the list if it's not already there
-  // Cores with the same address and port are considered the same
-  const addCore = (c: CoreConnectionInfo) => {
-    if (
-      coreList.some(
-        (core) => core.address === c.address && core.port === c.port
-      )
-    )
-      return;
-    setCoreList([...coreList, c]);
-  };
+  }, [apiVersion]);
   /* End Core */
 
   /* Start Token */
@@ -259,11 +154,8 @@ export default function App() {
       <LodestoneContext.Provider
         value={{
           core,
-          setCore,
-          addCore,
           coreConnectionStatus,
           setCoreConnectionStatus,
-          coreList,
           token,
           uid,
           setToken,
@@ -279,39 +171,7 @@ export default function App() {
           }}
         >
           <Routes>
-            {SAME_ORIGIN_CORE ? (
-              // No core to choose: the dashboard only ever talks to the core
-              // on its own origin. Old links land on the user login instead.
-              ['/first_setup', '/login/core/select', '/login/core/new'].map(
-                (path) => (
-                  <Route
-                    key={path}
-                    path={path}
-                    element={<MyNavigate to="/login/user/select" />}
-                  />
-                )
-              )
-            ) : (
-              <Route element={<LoginLayout />}>
-                <Route path="/first_setup" element={<FirstTime />} />
-                <Route
-                  path="/login/core/select"
-                  element={
-                    <RequireCore redirect="/login/core/new">
-                      <CoreSelectExisting />
-                    </RequireCore>
-                  }
-                />
-                <Route path="/login/core/new" element={<CoreConnect />} />
-              </Route>
-            )}
-            <Route
-              element={
-                <RequireCore>
-                  <LoginLayout />
-                </RequireCore>
-              }
-            >
+            <Route element={<LoginLayout />}>
               <Route
                 path="/login/core/first_setup"
                 element={<CoreSetupNew />}
@@ -339,11 +199,9 @@ export default function App() {
             </Route>
             <Route
               element={
-                <RequireCore>
-                  <RequireToken>
-                    <DashboardLayout />
-                  </RequireToken>
-                </RequireCore>
+                <RequireToken>
+                  <DashboardLayout />
+                </RequireToken>
               }
             >
               <Route element={<InstanceViewLayout />}>

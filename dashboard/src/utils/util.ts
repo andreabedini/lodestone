@@ -19,7 +19,6 @@ import { extendTailwindMerge, twMerge } from 'tailwind-merge';
 export const DISABLE_AUTOFILL = isEdge
   ? 'off-random-string-edge-stop-ignoring-autofill-off'
   : 'off';
-export const LODESTONE_PORT = 16662;
 
 /**
  * Path prefix the dashboard is served under, e.g. `/admin`. Set at build time
@@ -32,16 +31,14 @@ export const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 export const asset = (path: string) => `${BASE_PATH}${path}`;
 
 /**
- * With NEXT_PUBLIC_SAME_ORIGIN_CORE=true the default core is the one serving
- * the dashboard itself, i.e. a reverse proxy routes /api/v1 on the same origin
- * to the core. Otherwise it is a core on localhost.
+ * The one core this dashboard talks to: the origin serving it, where a reverse
+ * proxy routes /api/v1 to Lodestone core. There is no core selection.
  */
-export const SAME_ORIGIN_CORE =
-  process.env.NEXT_PUBLIC_SAME_ORIGIN_CORE === 'true';
-
-const sameOriginCore = (): CoreConnectionInfo | null => {
-  if (!SAME_ORIGIN_CORE) return null;
-  if (typeof window === 'undefined') return null;
+export const CORE: CoreConnectionInfo = (() => {
+  // Only reached while Next prerenders the static export; the browser always
+  // has a window.
+  if (typeof window === 'undefined')
+    return { address: '', port: '443', protocol: 'https', apiVersion: 'v1' };
   const { hostname, port, protocol } = window.location;
   const scheme = protocol.replace(':', '');
   return {
@@ -50,14 +47,7 @@ const sameOriginCore = (): CoreConnectionInfo | null => {
     protocol: scheme,
     apiVersion: 'v1',
   };
-};
-
-export const DEFAULT_LOCAL_CORE: CoreConnectionInfo = sameOriginCore() ?? {
-  address: 'localhost',
-  port: LODESTONE_PORT.toString(),
-  protocol: 'http',
-  apiVersion: 'v1',
-};
+})();
 export const myTwMerge = extendTailwindMerge({
   classGroups: {
     'font-size': [

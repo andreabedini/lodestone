@@ -1,13 +1,10 @@
 import { createContext } from 'react';
-import { LODESTONE_PORT } from 'utils/util';
+import { CORE } from 'utils/util';
 
 export type CoreConnectionStatus = 'loading' | 'error' | 'degraded' | 'success';
 
 interface LodestoneContext {
   core: CoreConnectionInfo;
-  setCore: (core: CoreConnectionInfo) => void;
-  addCore: (core: CoreConnectionInfo) => void;
-  coreList: CoreConnectionInfo[];
   coreConnectionStatus: CoreConnectionStatus;
   setCoreConnectionStatus: (status: CoreConnectionStatus) => void;
   /** The JWT token string, where no token is an empty string */
@@ -27,23 +24,11 @@ export interface CoreConnectionInfo {
 }
 
 export const LodestoneContext = createContext<LodestoneContext>({
-  core: {
-    address: '',
-    port: LODESTONE_PORT.toString(),
-    protocol: 'http',
-    apiVersion: 'v1',
-  } as CoreConnectionInfo,
+  core: CORE,
   coreConnectionStatus: 'loading',
-  addCore: () => {
-    console.error('addCore not implemented');
-  },
   setCoreConnectionStatus: () => {
     console.error('setCoreConnectionStatus not implemented');
   },
-  setCore: () => {
-    console.error('setCore not implemented');
-  },
-  coreList: [],
   token: '',
   uid: '',
   setToken: () => {

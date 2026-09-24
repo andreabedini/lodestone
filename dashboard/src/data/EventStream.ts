@@ -9,7 +9,6 @@ import { match, otherwise } from 'variant';
 import { NotificationContext } from './NotificationContext';
 import { EventQuery } from 'bindings/EventQuery';
 import axios from 'axios';
-import { LODESTONE_PORT } from 'utils/util';
 import { UserPermission } from 'bindings/UserPermission';
 import { PublicUser } from 'bindings/PublicUser';
 import { toast } from 'react-toastify';
@@ -438,8 +437,7 @@ export const useEventStream = () => {
     if (!token) return;
 
     const connectWebsocket = () => {
-      const wsAddress = `${core.protocol === 'https' ? 'wss' : 'ws'}://${core.address}:${core.port ?? LODESTONE_PORT
-        }/api/${core.apiVersion}/events/all/stream?filter=${JSON.stringify(
+      const wsAddress = `${core.protocol === 'https' ? 'wss' : 'ws'}://${core.address}:${core.port}/api/${core.apiVersion}/events/all/stream?filter=${JSON.stringify(
           eventQuery
         )}`;
 

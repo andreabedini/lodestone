@@ -2,7 +2,6 @@ import { useContext, useEffect, useState } from 'react';
 import { LodestoneContext } from './LodestoneContext';
 import { PerformanceReport } from 'bindings/PerformanceReport';
 import { useInterval } from 'usehooks-ts';
-import { LODESTONE_PORT } from 'utils/util';
 
 const emptyReport: PerformanceReport = {
   memory_usage: null,
@@ -36,9 +35,7 @@ export const usePerformanceStream = (uuid: string) => {
   useEffect(() => {
     try {
       const websocket = new WebSocket(
-        `${protocol === 'https' ? 'wss' : 'ws'}://${address}:${
-          port ?? LODESTONE_PORT
-        }/api/${apiVersion}/monitor/${uuid}`
+        `${protocol === 'https' ? 'wss' : 'ws'}://${address}:${port}/api/${apiVersion}/monitor/${uuid}`
       );
 
       websocket.onmessage = (messageEvent) => {

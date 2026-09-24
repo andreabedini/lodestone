@@ -808,3 +808,59 @@ pub async fn run(
         shutdown_tx,
     ))
 }
+
+#[cfg(test)]
+mod macro_runtime_tests;
+
+/// Install a minimal global [`AppState`] for tests that go through
+/// `app_state()`, such as the macro instance-control ops.
+///
+/// It starts with no instances. Tests add and remove their own instances with
+/// unique UUIDs, since the state is shared by every test in the process.
+#[cfg(test)]
+pub(crate) async fn init_test_app_state() -> &'static AppState {
+    static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    INIT.get_or_init(|| async {
+        let root = tempfile::TempDir::new()
+            .expect("failed to create temp dir for test app state")
+            .into_path();
+        let (tx, _rx) = EventBroadcaster::new(512);
+        let state = AppState {
+            instances: Arc::new(DashMap::new()),
+            users_manager: Arc::new(RwLock::new(UsersManager::new(
+                tx.clone(),
+                HashMap::new(),
+                root.join("users.json"),
+            ))),
+            events_buffer: Arc::new(Mutex::new(AllocRingBuffer::with_capacity(512))),
+            console_out_buffer: Arc::new(Mutex::new(HashMap::new())),
+            monitor_buffer: Arc::new(Mutex::new(HashMap::new())),
+            event_broadcaster: tx.clone(),
+            uuid: Uuid::new_v4().to_string(),
+            up_since: chrono::Utc::now().timestamp(),
+            global_settings: Arc::new(Mutex::new(GlobalSettings::new(
+                root.join("global_settings.json"),
+                tx.clone(),
+                GlobalSettingsData::default(),
+            ))),
+            system: Arc::new(Mutex::new(sysinfo::System::new())),
+            port_manager: Arc::new(Mutex::new(PortManager::new(HashSet::new()))),
+            first_time_setup_key: Arc::new(Mutex::new(None)),
+            playitgg_key: Arc::new(Mutex::new(None)),
+            download_urls: Arc::new(Mutex::new(HashMap::new())),
+            macro_executor: MacroExecutor::new(tx.clone(), tokio::runtime::Handle::current()),
+            sqlite_pool: sqlx::SqlitePool::connect_lazy("sqlite::memory:")
+                .expect("failed to create lazy sqlite pool"),
+            docker_bridge: docker_bridge::DockerBridge::new(
+                tx.clone(),
+                root.join("docker_bridge.json"),
+            )
+            .await
+            .expect("failed to create docker bridge"),
+            playit_keep_running: Arc::new(Mutex::new(None)),
+        };
+        init_app_state(state);
+    })
+    .await;
+    prelude::app_state()
+}

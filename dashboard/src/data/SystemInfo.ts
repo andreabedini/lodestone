@@ -1,4 +1,4 @@
-import { LODESTONE_PORT } from 'utils/util';
+import { LODESTONE_PORT, SAME_ORIGIN_CORE } from 'utils/util';
 import { useQuery } from '@tanstack/react-query';
 import axios, { AxiosError } from 'axios';
 import { useContext } from 'react';
@@ -97,6 +97,10 @@ export const useLocalCoreInfo = () => {
         .then((res) => res.data),
     {
       refetchInterval: 3000,
+      // Detects a core on the viewer's own machine. Pointless (and a
+      // local-network probe from a public page) when the dashboard is served
+      // next to its core.
+      enabled: !SAME_ORIGIN_CORE,
     }
   );
 };

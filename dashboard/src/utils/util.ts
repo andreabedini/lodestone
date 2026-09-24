@@ -36,8 +36,11 @@ export const asset = (path: string) => `${BASE_PATH}${path}`;
  * the dashboard itself, i.e. a reverse proxy routes /api/v1 on the same origin
  * to the core. Otherwise it is a core on localhost.
  */
+export const SAME_ORIGIN_CORE =
+  process.env.NEXT_PUBLIC_SAME_ORIGIN_CORE === 'true';
+
 const sameOriginCore = (): CoreConnectionInfo | null => {
-  if (process.env.NEXT_PUBLIC_SAME_ORIGIN_CORE !== 'true') return null;
+  if (!SAME_ORIGIN_CORE) return null;
   if (typeof window === 'undefined') return null;
   const { hostname, port, protocol } = window.location;
   const scheme = protocol.replace(':', '');

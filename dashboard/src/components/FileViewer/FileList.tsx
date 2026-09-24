@@ -195,7 +195,7 @@ export default function FileList({
       if (fileExt in iconMap) {
         return (
           <img
-            src={iconMap[fileExt]}
+            src={asset(iconMap[fileExt])}
             alt="file icon"
             draggable="false"
             className="h-4 w-4"

@@ -5,8 +5,9 @@ import DashboardCard from 'components/DashboardCard';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import InstanceOverview from 'components/Instance/InstanceOverview';
 import { match, otherwise } from 'variant';
+import { asset } from 'utils/util';
 
-const unknown_icon = '/assets/minecraft-missing-texture.svg';
+const unknown_icon = asset('/assets/minecraft-missing-texture.svg');
 
 import {
   faChartLine,
@@ -35,15 +36,15 @@ export const game_to_game_icon = (game: Game) =>
         variant,
         otherwise(
           {
-            Vanilla: () => '/assets/minecraft-vanilla.png',
-            Fabric: () => '/assets/minecraft-fabric.png',
-            Forge: () => '/assets/minecraft-forge.png',
-            Paper: () => '/assets/minecraft-paper.png',
+            Vanilla: () => asset('/assets/minecraft-vanilla.png'),
+            Fabric: () => asset('/assets/minecraft-fabric.png'),
+            Forge: () => asset('/assets/minecraft-forge.png'),
+            Paper: () => asset('/assets/minecraft-paper.png'),
           },
           () => unknown_icon
         )
       ),
-    Generic: () => '/assets/GenericIcon.svg',
+    Generic: () => asset('/assets/GenericIcon.svg'),
   });
 
 export const game_to_game_title = (game: Game) =>

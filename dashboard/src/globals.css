@@ -5,7 +5,7 @@
 /* Satoshi */
 @font-face {
   font-family: 'Satoshi';
-  src: url('/fonts/Satoshi-Variable.woff2') format('woff2');
+  src: url('../public/fonts/Satoshi-Variable.woff2') format('woff2');
   font-weight: 300 900;
   font-style: normal;
   font-display: swap;
@@ -13,7 +13,7 @@
 
 @font-face {
   font-family: 'Satoshi';
-  src: url('/fonts/Satoshi-VariableItalic.woff2') format('woff2');
+  src: url('../public/fonts/Satoshi-VariableItalic.woff2') format('woff2');
   font-weight: 300 900;
   font-style: italic;
   font-display: swap;
@@ -22,7 +22,7 @@
 /* Chillax */
 @font-face {
   font-family: 'Chillax';
-  src: url('/fonts/Chillax-Variable.woff2') format('woff2');
+  src: url('../public/fonts/Chillax-Variable.woff2') format('woff2');
   font-weight: 200 700;
   font-display: swap;
   font-style: normal;
@@ -31,7 +31,7 @@
 /* JetBrains Mono */
 @font-face {
   font-family: 'JetBrains Mono';
-  src: url('/fonts/JetBrainsMono-Variable.woff2') format('woff2');
+  src: url('../public/fonts/JetBrainsMono-Variable.woff2') format('woff2');
   font-weight: 100 800;
   font-display: swap;
   font-style: normal;
@@ -39,7 +39,7 @@
 
 @font-face {
   font-family: 'JetBrains Mono';
-  src: url('/fonts/JetBrainsMono-VariableItalic.woff2') format('woff2');
+  src: url('../public/fonts/JetBrainsMono-VariableItalic.woff2') format('woff2');
   font-weight: 100 800;
   font-display: swap;
   font-style: italic;
@@ -48,7 +48,7 @@
 /* Clash Grotesk */
 @font-face {
   font-family: 'Clash Grotesk';
-  src: url('/fonts/ClashGrotesk-Variable.woff2') format('woff2');
+  src: url('../public/fonts/ClashGrotesk-Variable.woff2') format('woff2');
   font-weight: 200 700;
   font-display: swap;
   font-style: normal;
@@ -57,7 +57,7 @@
 /* Minecraft Changed */
 @font-face {
   font-family: 'Minecraft Changed';
-  src: url('/fonts/Minecraft_changed.woff') format('woff');
+  src: url('../public/fonts/Minecraft_changed.woff') format('woff');
   font-weight: 400;
   font-display: swap;
   font-style: normal;

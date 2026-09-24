@@ -3,7 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { ClientFile } from 'bindings/ClientFile';
 import clsx from 'clsx';
 import Checkbox from 'components/Atoms/Checkbox';
-import { formatBytes, formatTimeAgo, supportedZip } from 'utils/util';
+import { formatBytes, formatTimeAgo, supportedZip, asset } from 'utils/util';
 import FileContextMenu from './FileContextMenu';
 import React, { useState, useEffect, useRef } from 'react';
 import { useEventListener, useOnClickOutside } from 'usehooks-ts';
@@ -176,13 +176,13 @@ export default function FileList({
   function fileToIcon(file: ClientFile) {
     if (file.file_type === 'Directory') {
       return (
-        <img src="/icons/folder-blue.svg" alt="folder icon" draggable="false" />
+        <img src={asset('/icons/folder-blue.svg')} alt="folder icon" draggable="false" />
       );
     } else if (file.file_type === 'File') {
       if (file.file_stem === '.lodestone_config') {
         return (
           <img
-            src="/icons/lodestone.svg"
+            src={asset('/icons/lodestone.svg')}
             alt="file icon"
             draggable="false"
             // because the lodestone icon is a bit bigger than the others
@@ -204,7 +204,7 @@ export default function FileList({
       } else {
         return (
           <img
-            src="/icons/file.svg"
+            src={asset('/icons/file.svg')}
             alt="file icon"
             draggable="false"
             className="h-4 w-4"

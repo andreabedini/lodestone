@@ -7,7 +7,7 @@ import * as yup from 'yup';
 import { useCoreInfo } from 'data/SystemInfo';
 import { faArrowLeft, faArrowRight } from '@fortawesome/free-solid-svg-icons';
 import { BrowserLocationContext } from 'data/BrowserLocationContext';
-import { DISABLE_AUTOFILL, isLocalCore } from 'utils/util';
+import { DISABLE_AUTOFILL, isLocalCore, asset } from 'utils/util';
 import { loginToCore } from 'utils/apis';
 import { tauri } from 'utils/tauriUtil';
 import { useDocumentTitle } from 'usehooks-ts';
@@ -65,7 +65,7 @@ const UserLogin = () => {
   return (
     <div className="flex w-[468px] max-w-full flex-col items-stretch justify-center gap-12 rounded-2xl px-12 py-14 transition-dimensions @container">
       <div className="flex flex-col items-start">
-        <img src="/logo.svg" alt="logo" className="h-8" />
+        <img src={asset('/logo.svg')} alt="logo" className="h-8" />
         <h1 className="font-title text-h1 font-bold tracking-medium text-gray-300">
           Sign in
         </h1>

@@ -2,7 +2,7 @@ import { useContext, useEffect, useState } from 'react';
 import { InstanceContext } from 'data/InstanceContext';
 import { useLocation } from 'react-router-dom';
 import Label from 'components/Atoms/Label';
-import { cn, stateToLabelColor } from 'utils/util';
+import { cn, stateToLabelColor, asset } from 'utils/util';
 import Spinner from 'components/DashboardLayout/Spinner';
 import { CommandHistoryContextProvider } from 'data/CommandHistoryContext';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
@@ -77,7 +77,7 @@ export const tabs = [
     content: (
       <DashboardCard className="grow justify-center gap-4">
         <img
-          src="/assets/placeholder-cube.png"
+          src={asset('/assets/placeholder-cube.png')}
           alt="placeholder"
           className="mx-auto w-20"
           style={{ imageRendering: 'pixelated' }}

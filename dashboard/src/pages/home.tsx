@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { asset } from 'utils/util';
 import { useEffect, useState } from 'react';
 import { useDocumentTitle } from 'usehooks-ts';
 import { useUserAuthorized, useUserInfo, useUserLoggedIn } from 'data/UserInfo';
@@ -33,7 +34,7 @@ const Home = () => {
     <div className="relative flex flex-col items-center justify-center overflow-auto text-gray-faded/30">
       <div className="flex h-28 w-28 items-center justify-center rounded-full border border-dashed border-gray-faded/30 align-middle">
         <img
-          src="/assets/placeholder-cube.png"
+          src={asset('/assets/placeholder-cube.png')}
           alt="placeholder"
           className="mx-auto w-20"
           style={{ imageRendering: 'pixelated' }}

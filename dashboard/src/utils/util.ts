@@ -20,7 +20,36 @@ export const DISABLE_AUTOFILL = isEdge
   ? 'off-random-string-edge-stop-ignoring-autofill-off'
   : 'off';
 export const LODESTONE_PORT = 16662;
-export const DEFAULT_LOCAL_CORE: CoreConnectionInfo = {
+
+/**
+ * Path prefix the dashboard is served under, e.g. `/admin`. Set at build time
+ * with NEXT_PUBLIC_BASE_PATH (next.config.js reads the same variable); empty
+ * when the dashboard is served from the root.
+ */
+export const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
+
+/** Prefix an absolute path to a file in public/ with BASE_PATH. */
+export const asset = (path: string) => `${BASE_PATH}${path}`;
+
+/**
+ * With NEXT_PUBLIC_SAME_ORIGIN_CORE=true the default core is the one serving
+ * the dashboard itself, i.e. a reverse proxy routes /api/v1 on the same origin
+ * to the core. Otherwise it is a core on localhost.
+ */
+const sameOriginCore = (): CoreConnectionInfo | null => {
+  if (process.env.NEXT_PUBLIC_SAME_ORIGIN_CORE !== 'true') return null;
+  if (typeof window === 'undefined') return null;
+  const { hostname, port, protocol } = window.location;
+  const scheme = protocol.replace(':', '');
+  return {
+    address: hostname,
+    port: port || (scheme === 'https' ? '443' : '80'),
+    protocol: scheme,
+    apiVersion: 'v1',
+  };
+};
+
+export const DEFAULT_LOCAL_CORE: CoreConnectionInfo = sameOriginCore() ?? {
   address: 'localhost',
   port: LODESTONE_PORT.toString(),
   protocol: 'http',

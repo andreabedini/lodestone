@@ -1,7 +1,7 @@
 import axios from 'axios';
 import Button from 'components/Atoms/Button';
 import { useContext } from 'react';
-import { DISABLE_AUTOFILL, errorToString, LODESTONE_PORT } from 'utils/util';
+import { DISABLE_AUTOFILL, errorToString, LODESTONE_PORT, asset } from 'utils/util';
 import { CoreConnectionInfo, LodestoneContext } from 'data/LodestoneContext';
 import InputField from 'components/Atoms/Form/InputField';
 import { Form, Formik, FormikHelpers } from 'formik';
@@ -115,7 +115,7 @@ const CoreConnect = () => {
         </ConfirmDialog>
       )}
       <div className="flex flex-col items-start">
-        <img src="/logo.svg" alt="logo" className="h-8" />
+        <img src={asset('/logo.svg')} alt="logo" className="h-8" />
         <h1 className="font-title text-h1 font-bold tracking-medium text-gray-300">
           Add a new core
         </h1>

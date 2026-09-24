@@ -1,4 +1,5 @@
 import { LodestoneContext } from 'data/LodestoneContext';
+import { asset } from 'utils/util';
 import { Fragment, useContext, useEffect, useState } from 'react';
 import {
   faCaretDown,
@@ -69,7 +70,7 @@ export default function TopNav() {
       <div className="flex w-full shrink-0 select-none flex-row items-center justify-end gap-4 border-b border-gray-faded/30 bg-gray-800 px-4 py-2">
         <div className="grow">
           <img
-            src="/logo.svg"
+            src={asset('/logo.svg')}
             alt="logo"
             className="w-32 hover:cursor-pointer"
             onClick={() => {

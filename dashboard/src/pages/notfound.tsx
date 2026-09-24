@@ -1,5 +1,6 @@
 import Button from 'components/Atoms/Button';
 import { useDocumentTitle } from 'usehooks-ts';
+import { BASE_PATH } from 'utils/util';
 
 export default function NotFound() {
   useDocumentTitle('404 - Lodestone');
@@ -11,7 +12,7 @@ export default function NotFound() {
         label="Go Home"
         className="mt-4"
         onClick={() => {
-          window.location.href = '/';
+          window.location.href = `${BASE_PATH}/`;
         }}
       />
     </div>

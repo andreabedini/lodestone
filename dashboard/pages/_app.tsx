@@ -7,6 +7,7 @@ import '@fortawesome/fontawesome-svg-core/styles.css';
 import axios from 'axios';
 import NoSSR from 'react-no-ssr';
 import { BrowserRouter } from 'react-router-dom';
+import { BASE_PATH } from 'utils/util';
 import { BrowserLocationContextProvider } from 'data/BrowserLocationContext';
 import { ToastContainer, Zoom, IconProps } from 'react-toastify';
 import LoadingStatusIcon from 'components/Atoms/LoadingStatusIcon';
@@ -63,7 +64,7 @@ function MyApp({ Component, pageProps }: AppProps) {
           theme="dark"
           transition={Zoom}
         />
-        <BrowserRouter>
+        <BrowserRouter basename={BASE_PATH || undefined}>
           <BrowserLocationContextProvider>
             <Component {...pageProps} />
           </BrowserLocationContextProvider>

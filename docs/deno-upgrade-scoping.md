@@ -1,7 +1,7 @@
 # Deno stack upgrade — scoping
 
 - **Date:** 2026-09-24
-- **Status:** Phase 0 done (2026-09-24, §7); Phases 1–4 not started
+- **Status:** done. Phase 0 and Phases 1–4 finished 2026-09-24 (§7); deviations from this plan are in §10. Notes for macro authors: `docs/macro-runtime.md`.
 - **Related:** `docs/codebase-assessment.md` §4 Phase 3 item 13, §7.1; S1 (macro sandbox)
 
 ## 1. Summary
@@ -136,24 +136,24 @@ Phase 0 results that matter for Phases 1–3:
 - `__instance_uuid` is now `null` without an instance (it was the string `"null"`).
 - The procedure bridge, instance-control ops and send_command fix are tested against a real `GenericInstance` driven by a fake atom. The RCON ops are tested only for their generic-instance error; the Minecraft paths need a running server.
 
-**Phase 1 — dependencies (about 0.5 day)**
+**Phase 1 — dependencies (about 0.5 day)** — ✅ done 2026-09-24
 
 4. Swap the crates as in §2 and delete `vendor/v8` + the patch.
 5. `cargo update` `serde` and `time`, and confirm `time ≥ 0.3.47`.
 6. Check that the `libsqlite3-sys` link does not conflict with the sqlx fork (it shouldn't without `deno_runtime`, but verify).
 
-**Phase 2 — ops and extension (about 1–2 days)**
+**Phase 2 — ops and extension (about 1–2 days)** — ✅ done 2026-09-24
 
 7. Convert the 46 ops to `#[op2]`, add the `MacroOpError` type, and merge the 6 builders into `extension!`.
 
-**Phase 3 — runtime, loader, shim (about 3–4 days)**
+**Phase 3 — runtime, loader, shim (about 3–4 days)** — ✅ done 2026-09-24
 
 8. Replace `MainWorker` with `JsRuntime` plus our extension, the ESM entry point, the `Deno` shim and the compat shim.
 9. Port the loader.
 10. Handle termination with a flag.
 11. Optionally add `deno_fs` with scoped permissions (decision A).
 
-**Phase 4 — verify and document (about 1–2 days)**
+**Phase 4 — verify and document (about 1–2 days)** — ✅ done 2026-09-24, except `cargo audit` (not installed; §10) and the wiki (outside this repository)
 
 12. Run the Phase 0 tests and the auto-backup example end to end, plus one macro-lib example against the embedded glue.
 13. Run `cargo audit`.
@@ -175,3 +175,21 @@ Phase 0 results that matter for Phases 1–3:
 - Ops hidden from `Deno[Deno.internal]`: https://github.com/denoland/deno/discussions/18591
 - op2 migration tracking: https://github.com/denoland/deno/issues/19915
 - A reference for using `deno_core` + extensions without `deno_runtime`: `rustyscript` (not usable as a dependency, because it is about 60 `deno_core` versions behind)
+
+## 10. Outcome and deviations from the plan (Phases 1–4, 2026-09-24)
+
+The migration follows a spike (a standalone crate with the same versions, run on rustc 1.96.0). Where the spike's findings differed from §4–§7, the spike won:
+
+- **Threading (changes §4.1's "unchanged in principle").** deno_core 0.412's async ops `tokio::spawn` a `!Send` future through `deno_unsync`. Driving `JsRuntime` in a `LocalSet` on Lodestone's shared multi-thread runtime panics in debug builds and is unsound in release. So each macro thread (named `macro-<pid>`) now builds **its own current-thread runtime**. The shared runtime's `Handle` is kept in `OpState`, and every op that touches the app state or an instance runs its body there through `deno_ops::run_on_shared`. This matters because instance code spawns tasks (a Minecraft server's supervision tasks) and owns IO (RCON) that must not die with the macro. The event and procedure-bridge ops only use channels and stay on the macro's runtime. A test (`ops_run_on_the_shared_runtime`) checks that such an op runs on the shared runtime and that a task it spawns outlives the macro; it uses a test op built on the same helper, because no instance in the test setup spawns tasks.
+- **Termination.** Phase 0's flag is kept. `abort_macro` also wakes the macro's event loop through a `Notify` that the run future is raced against, so a macro idle in `await next_event()` is killed too (`terminate_execution` alone only interrupts running JS). Test: `abort_idle_macro`.
+- **Crates.** Besides §2's list: `deno_io` (deno_web's `console` prints through it; needs `Stdio`), `deno_net` (deno_fetch's JS loads its TLS module), `deno_permissions` and `deno_error`. All `deno_*` crates are pinned with `=`. No `deno_telemetry`: `bootstrap.js` installs a "tracing disabled" stub that deno_fetch's JS accepts.
+- **Extensions.** One `lodestone` extension (`macro_executor/extension.rs`) with 41 ops (40 macro ops and `lodestone_bootstrap_info`, which only `bootstrap.js` sees), plus `lodestone_procedure_bridge` (3 ops) for generic instances. So macros see 43 ops (13 events, 26 instance control, 1 prelude, 3 bridge); §4.1's "46" was a miscount. `WorkerOptionGenerator` became `ExtensionGenerator` (`fn generate(&self) -> Vec<Extension>`); the two identical generic-instance generators became one `ProcedureBridgeExtension`. The compat shim exposes exactly the ops of these extensions.
+- **Op conversion.** `#[op2]` with `#[serde]`/`#[string]`; `Option<f64>` and `#[string] Option<String>` are native op2 types (`#[serde]` is rejected for them). op2 did not ask for `(fast)` on any op. `MacroOpError` has only the `anyhow` catch-all (class `Error`), so JS sees the same error class as before; its message is the full context chain.
+- **`MacroExecutor::spawn`** takes a new last argument, `fs_root: Option<PathBuf>`: Minecraft macros and `prelaunch` get the instance directory, as do generic instances (`new`, `restore`). `GenericInstance::setup_manifest` runs before any instance exists and gets **no fs access**. `spawn` now waits up to 10 s (was 1 s) for the `Started` event, and fails at once if the macro stops before starting (the runtime is built before `Started` is sent).
+- **Permissions.** The spike's `ScopedParser` wraps Deno's descriptor parser: paths are resolved against the root, normalised, and canonicalised, so `..` and symlink escapes are denied. Denials are `NotCapable` errors, which `bootstrap.js` also makes `instanceof Deno.errors.PermissionDenied`. Without a root, `allow_read`/`allow_write` are `None` (deny all); note that `Some(vec![])` would mean *allow all*.
+- **Extension JS is embedded by `build.rs` (not in the spike).** deno_core 0.412's `extension!` records each extension's JS files (deno_web, deno_fetch, ..., our `bootstrap.js`) only by absolute build-time path, and a runtime without a V8 snapshot reads them from disk at every `JsRuntime` creation. The spike ran next to its cargo registry, so it never noticed; a shipped binary would fail to start any macro. `core/build.rs` now finds those crates with `cargo metadata --offline` and embeds their `.js`/`.ts` files, and `macro_executor/extension.rs::embed_sources` replaces every disk-backed source with the embedded copy before the runtime is built (a missing file is an error, not a disk read). Verified by hiding the six crates' source directories and `bootstrap.js`, then running macro tests from the same test binary. A V8 startup snapshot would be the upstream way, but needs the extension definitions in a separate crate that `build.rs` can depend on.
+- **Console output** still goes to Lodestone's stdout (`log`/`info`/`debug`) and stderr (`warn`/`error`), as with `deno_runtime`.
+- **JSON imports.** `with { type: "json" }` works everywhere. `assert { type: "json" }` still works in TypeScript files (deno_ast rewrites it) but is a `SyntaxError` in plain `.js` files, which are not transpiled. The Phase 0 test with `assert` passes unchanged; two tests cover the rest.
+- **Cargo.lock side effects.** `serde` 1.0.229, `time` 0.3.55. Two extra bumps were needed: `indexmap` 2.2.2 → 2.14.2 (deno's `serde_json` with `preserve_order` needs `shift_insert`) and `async-compression` 0.4.0 → 0.4.48 (the old one pulled `brotli 3`, whose C symbols clashed with deno_web's `brotli 6` at link time). `libsqlite3-sys` is still only the sqlx fork's 0.25.2.
+- **Not done:** `cargo audit` (not installed here; §7.2 of the assessment was updated from `cargo tree` only), the wiki, and an on-disk cache for remote modules. `lodestone-macro-lib` was exercised only by the `#[ignore]`d `macro_lib_uses_embedded_glue` test, run separately with network access.
+

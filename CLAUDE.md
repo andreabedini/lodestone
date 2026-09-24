@@ -12,7 +12,7 @@ Lodestone is a self-hosted manager for Minecraft / multiplayer game servers.
   types in `dashboard/src/bindings/` are **generated from Rust** via `ts-rs`
   (`#[derive(TS)]`) — don't hand-edit them; regenerate from the Rust side.
 - **`dashboard/src-tauri/`** — Tauri 1.4 desktop wrapper (second workspace member).
-- Embedded **Deno runtime** (`deno_core`) runs user "macros"; `bollard` drives
+- Embedded **Deno** (`deno_core`, no `deno_runtime`) runs user "macros"; `bollard` drives
   Docker; `playit.gg` provides tunneling.
 
 ## Build & test
@@ -21,7 +21,7 @@ Lodestone is a self-hosted manager for Minecraft / multiplayer game servers.
 # Backend (default member) — prefer `check` for fast iteration
 cargo check -p lodestone_core
 cargo build -p lodestone_core
-cargo test --no-fail-fast -- --test-threads=1   # what CI runs; ~140 unit tests, no integration tests
+cargo test --no-fail-fast -- --test-threads=1   # what CI runs; ~155 unit tests, no integration tests
 cargo clippy
 
 # Dashboard
@@ -34,35 +34,48 @@ npm run build                       # next build && next export
 JSON files in instance dirs (`.lodestone_config`); the SQLite DB stores only the
 event log.
 
-## ⚠️ The Deno/V8 stack is old — read before upgrading
+## The macro runtime (Deno stack) — read before upgrading
 
-`rust-toolchain.toml` pins **Rust 1.96.0**. The old Deno stack (`deno_core 0.190`,
-`deno_runtime 0.116`, `v8 0.73`, 2023) only builds on it because of a local patch:
+`rust-toolchain.toml` pins **Rust 1.96.0**. Macros run on `deno_core` without
+`deno_runtime` (upgraded 2026-09-24; see `docs/deno-upgrade-scoping.md`):
 
-- **`vendor/v8/`** is the published `v8 0.73.0` crate (only `Cargo.toml`, `build.rs`,
-  `src/`, `tools/download_file.py`), wired in via `[patch.crates-io]` in the root
-  `Cargo.toml`. The upstream crate asserts `size_of::<TypeId>() == size_of::<u64>()`,
-  which fails with `E0080` on rustc ≥ 1.72 (TypeId is 128-bit). The fix is in
-  `TypeIdHasher` in `vendor/v8/src/isolate.rs`, marked `LODESTONE PATCH`. The build
-  still downloads the prebuilt `librusty_v8` 0.73.0 from GitHub release assets
-  (`github.com` + `release-assets.githubusercontent.com`).
-- Remove `vendor/v8` and the patch once the Deno stack is upgraded to a `deno_core`
-  that pulls `v8 ≥ 0.74` (which handles 128-bit TypeId upstream).
-
-**Known dependency walls (held by the old Deno/swc crates, not by rustc):**
-
-- `serde` must stay old: `serde 1.0.229` (which splits out `serde_core`) breaks the old
-  `swc_common` with `unresolved import serde::__private`. `1.0.193` is known good.
-  Because `time ≥ 0.3.46` requires the newer serde, **`time` is capped at 0.3.44**
-  (so RUSTSEC-2026-0009, fixed in 0.3.47, stays open until the Deno upgrade).
-- Plain `cargo update` / `cargo update -p X` may pull the newer serde now that
-  `rust-version` is 1.96. After any update, check `Cargo.lock` still has
-  `serde 1.0.193` and run `cargo check`; pin with `cargo update -p X --precise <ver>`.
-- Do not bump `rust-toolchain.toml` further without re-running the full test suite:
-  `vendor/v8` is only verified on 1.96.0 (and `cargo check` on 1.98.1).
+- **Crates, pinned exactly** in `core/Cargo.toml`: `deno_core`, `deno_ast`,
+  `deno_error`, `deno_webidl`, `deno_web`, `deno_io`, `deno_fs`, `deno_fetch`,
+  `deno_net`, `deno_permissions`. deno_core's embedding API breaks between
+  releases, so **upgrade them together**: pick one Deno CLI release, take the
+  versions it uses, bump all pins, fix the compile errors, then run the macro
+  tests (below). Do not add `deno_runtime` (it hides our ops, and it pulls a
+  `libsqlite3-sys` that conflicts with the sqlx fork).
+- **Threading:** one OS thread per macro (`macro-<pid>`), each with its **own
+  current-thread tokio runtime** (deno_core's async ops `tokio::spawn` `!Send`
+  futures, which is only sound there). Op bodies that touch the app state or an
+  instance must go through `deno_ops::run_on_shared`, which runs them on the
+  shared runtime: instance code spawns tasks (server supervision) and owns IO
+  that must outlive the macro. Termination: `abort_macro` sets a flag, calls
+  `terminate_execution()` and wakes the macro's event loop through a `Notify`.
+- **Where things are:** ops in `core/src/deno_ops/` (`#[op2]`, error type
+  `MacroOpError`; the procedure bridge ops in
+  `implementations/generic/bridge/procedure_call.rs`); the `lodestone`
+  extension in `core/src/macro_executor/extension.rs`; the ESM entry point in
+  `core/src/macro_executor/bootstrap.js` (web globals, the `Deno` namespace —
+  its `DENO_API` block is the one list of what macros get — and the compat
+  shim `Deno[Deno.internal].core.{ops,opAsync}` that the glue uses); the module
+  loader and permissions in `core/src/macro_executor/{loader,permissions}.rs`.
+- **Permissions:** `Deno.*` fs is limited to the macro's root (the instance
+  directory; `MacroExecutor::spawn`'s `fs_root`), with `..` and symlink
+  escapes denied; no root means no fs access. Network (`fetch`) is open.
+- **Extension JS is embedded by `core/build.rs`** (`DENO_EXTENSION_CRATES`). deno_core
+  otherwise reads it from the build machine's cargo registry at runtime. A new Deno
+  extension crate must be added there, or building a runtime fails with "not
+  embedded in this build".
+- Op names have no `op_` prefix (the glue uses them). A test
+  (`lodestone_op_names_do_not_collide`) checks they don't clash with deno ops.
 
 ## Sandbox / environment notes
 
+- The `v8` build script downloads a prebuilt `librusty_v8` archive per profile
+  (debug and release are separate downloads) from GitHub (`github.com` +
+  `release-assets.githubusercontent.com`).
 - Forked **git dependencies** (`sqlx`, `safe_path_subset`, `playit-agent` ×2) live
   under `~/.cargo/git/`. Fetching them needs that dir writable and network access to
   `github.com` + `crates.io`. If a build fails with "Read-only file system" on
@@ -70,12 +83,15 @@ event log.
 - `cargo` is deterministic: prefer regenerating `Cargo.lock` via targeted
   `cargo update -p <crate>` over hand-editing it.
 
-## Security posture (important context, not yet fixed)
+## Security posture (important context, not fully fixed)
 
 The README advertises strong sandboxing, but be aware:
 
-- **Macros run with `Permissions::allow_all()`** (`core/src/macro_executor.rs`) — user
-  macro JS has full host access. Don't describe macros as sandboxed until this is fixed.
+- **Macros are only partly sandboxed.** The `Deno.*` fs API is scoped to the instance
+  directory, and `Deno.run`/`Command`/`env`/`exit` don't exist. But `fetch` can reach
+  any host (including LAN and localhost services), module imports can read any local
+  file (`import x from "file:///…" with { type: "json" }`), and the ops can start, stop
+  and command every instance. Don't describe macros as a security boundary.
 - **Global file manager** (`core/src/handlers/global_fs.rs`) is arbitrary host
   read/write by design, gated only by the `ReadGlobalFile`/`WriteGlobalFile`
   permission + a `safe_mode` toggle. Treat `can_write_global_file` as root-equivalent.

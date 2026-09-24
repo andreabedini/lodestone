@@ -14,17 +14,20 @@
 | **Frontend** | Next.js 13 + React 18 + TypeScript (~235 TS/TSX files in `dashboard/src`), Tauri 1.4 desktop wrapper |
 | **Notable subsystems** | Embedded **Deno runtime** for user "macros", SQLite event log (forked sqlx), Docker via `bollard`, playit.gg tunneling, UPnP |
 | **Last upstream commit** | **2024-09-09** |
-| **Toolchain pin** | **Rust 1.96.0**, made possible by a one-function patch to the vendored `v8 0.73` crate (`vendor/v8`); see §7.1 |
-| **Tests** | ~44 backend unit tests, **0 frontend tests**, no integration tests |
+| **Toolchain pin** | **Rust 1.96.0**; the Deno stack is `deno_core 0.412` (v8 150) since 2026-09-24, with no local patches; see §7.1 |
+| **Tests** | ~155 backend unit tests (including ~30 that run macro JS), **0 frontend tests**, no integration tests |
 | **Dependency health** | Several git forks. Most dependencies are about 2 years behind. Latest audit: 25 RustSec vulnerabilities and 314 npm advisories (§7) |
 
 The architecture is sound. It has clean trait-based layering (handlers → traits → implementations). The TypeScript bindings are generated from Rust via `ts-rs`, so the API types can't drift. The core is event-driven, and permissions are fine-grained. The problems are **stale dependencies, an over-permissive macro sandbox, thin testing, and error handling that panics too easily**. The underlying design is not the problem.
 
 ## 2. Urgent issues — Security
 
-### 🔴 S1 — The Deno macro sandbox runs with `allow_all`
+### 🟠 S1 — The Deno macro sandbox runs with `allow_all` (partly fixed 2026-09-24)
 
-`core/src/macro_executor.rs:350-352`:
+> [!NOTE]
+> **Status (2026-09-24):** the Deno upgrade replaced `allow_all` with a scoped `PermissionsContainer` (`core/src/macro_executor/permissions.rs`). The `Deno.*` fs API can only read and write the instance directory (`..` and symlink escapes are denied); a macro with no instance has no fs access. Subprocesses, environment access and `Deno.exit` are gone: the extensions that implement them are not loaded. **Still open:** network access is unrestricted (`fetch` to any host, including LAN and localhost services); module imports can read any local file (a JSON import of any JSON file, or executing any `.js`/`.ts`); and the ops let any macro start, stop, reconfigure and send commands to *every* instance, not only its own. The text below describes the state before the upgrade.
+
+Before the upgrade, `core/src/macro_executor.rs:350-352`:
 
 ```rust
 PermissionsContainer::new(
@@ -47,7 +50,7 @@ The `monitor` handler at `core/src/handlers/monitor.rs:23` serves the route `/mo
 
 ### 🟠 S4 — Stale dependency tree
 
-The project was pinned to Rust 1.70 until 2026-09-24 (now 1.96, §7.1). It still uses axum 0.6 and `rand 0.6.5` (from 2019). It also uses an old `deno_core`/`deno_runtime` and several unmaintained crates (`ansi_term`, `tempdir`). The May 2026 quick wins cleared the openssl, bytes, h2, mio, tar and whoami advisories, and pinned `bollard` to 0.15. A real `cargo audit` run (§7.2) still reports **25 vulnerabilities** in the workspace, and most of them are reachable from `lodestone_core`. Most of the remaining fixes are blocked behind the Deno, axum and sqlx-fork upgrades.
+The project was pinned to Rust 1.70 until 2026-09-24 (now 1.96, §7.1). It still uses axum 0.6 and `rand 0.6.5` (from 2019). Its Deno stack was upgraded on 2026-09-24 (`deno_core 0.412`); it still uses several unmaintained crates (`ansi_term`, `tempdir`). The May 2026 quick wins cleared the openssl, bytes, h2, mio, tar and whoami advisories, and pinned `bollard` to 0.15. A real `cargo audit` run (§7.2) still reports **25 vulnerabilities** in the workspace, and most of them are reachable from `lodestone_core`. Most of the remaining fixes are blocked behind the axum and sqlx-fork upgrades (the Deno upgrade cleared `time`, `idna` and the `deno_crypto` chain; see §7.2).
 
 ### 🟡 S5 — CORS `allow_origin(Any)`
 
@@ -96,7 +99,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 5. **S3/S7:** Add `AuthBearer` and permission checks to the monitor WebSocket and the playit.gg routes. Add a router-level test asserting that every non-public route rejects an empty token.
 6. **S5:** Replace `allow_origin(Any)` with a configurable origin allowlist, defaulting to the bundled dashboard origin.
 7. **S6:** Remove `unwrap()` from `auth/`, the WebSocket send loops and `handlers/`, converting to `?`/`Result`. Replace `rand 0.6.5` with `rand 0.8` and `OsRng` for all secret generation (`core/src/util.rs:455`).
-8. **S1:** Replace `Permissions::allow_all()` with a least-privilege `PermissionsContainer`: restrict macro filesystem access to the instance directory, deny subprocesses and environment access, and allowlist network destinations. This is the highest-value single change once anyone else can author macros.
+8. **S1:** Replace `Permissions::allow_all()` with a least-privilege `PermissionsContainer`: restrict macro filesystem access to the instance directory, deny subprocesses and environment access, and allowlist network destinations. This is the highest-value single change once anyone else can author macros. *Partly done 2026-09-24 with the Deno upgrade (fs scoped, no subprocess/env); still open: network allowlist, instance-scoped ops, and imports of local files.*
 9. **S2:** Put `can_write_global_file` behind an explicit confirmation in the UI, turn `safe_mode` on by default, and document that the permission is equivalent to root on the host. Consider an opt-in path allowlist.
 
 ### Phase 2 — Build the safety net
@@ -107,14 +110,14 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 
 ### Phase 3 — Dependency modernization
 
-13. **Upgrade the Deno stack** (`deno_core` / `deno_runtime` / `deno_ast`, which bring a newer `v8`). Scoped in `docs/deno-upgrade-scoping.md` (2026-09-24): target `deno_core` 0.412 without `deno_runtime`. Its Phase 0 is done (2026-09-24): macro runtime tests, the bugs found while scoping, and the JS glue embedded in the binary instead of fetched from upstream GitHub. It is no longer needed for the toolchain (§7.1), but it still clears the `deno_crypto` advisories (rsa, ring, aes-gcm, curve25519-dalek) and makes S1 easier to harden. It also lifts the old-`serde` cap (which holds `time` below its RUSTSEC-2026-0009 fix) and lets `vendor/v8` be deleted.
+13. ✅ **Upgrade the Deno stack** — done 2026-09-24 (`docs/deno-upgrade-scoping.md`). Now `deno_core 0.412` + `deno_ast 0.53` + `deno_web`/`deno_fs`/`deno_fetch`, without `deno_runtime`; `vendor/v8` and the `serde` cap are gone, `time` is 0.3.55, and the `deno_crypto` chain (rsa, aes-gcm, curve25519-dalek) is out of the tree. The macro fs API is scoped to the instance directory (S1, partly).
 14. Upgrade in dependency order (no longer blocked by the toolchain): `axum 0.6 → 0.7+` (router and extractor API changes; brings hyper 1 / h2 0.4 and a fixed tungstenite), Next.js 13 → 14/15, React Query 4 → 5, and Tauri 1.4 → 2.x if the desktop app is ever used.
 15. **Retire the sqlx fork**: move to upstream modern sqlx and a real migration setup (`sqlx migrate`).
 16. Resolve the dual `playit-agent` dependency to a single version.
 
 ### Ongoing hygiene
 
-- Dependabot or Renovate on both `Cargo.toml` and `package.json`, with `serde` held at 1.0.193 until the Deno upgrade (§7.1).
+- Dependabot or Renovate on both `Cargo.toml` and `package.json`. Exclude the exactly pinned `deno_*` crates, which must move together (`CLAUDE.md`).
 - CI gates: `cargo audit`, `cargo deny`, `cargo clippy -D warnings`, `npm audit`, plus the new test suites.
 - A documented release and versioning process (currently 0.5.1, with no changelog).
 
@@ -123,7 +126,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 **Near-term (3–6 months)**
 
 - Turn the **least-privilege macro sandbox** into a first-class capability model: each macro declares its permissions, and the user sees them before it runs.
-- Split the oversized files: `minecraft/configurable.rs` into per-modloader modules, and the Deno setup, module loader and permissions out of `macro_executor.rs`.
+- Split the oversized files: `minecraft/configurable.rs` into per-modloader modules. (The Deno extension, module loader and permissions moved out of `macro_executor.rs` into `macro_executor/` with the Deno upgrade.)
 - A structured **audit log / event viewer** (the README's "Event viewer" to-do). The SQLite event log already exists; it just needs surfacing.
 
 **Mid-term (6–12 months)**
@@ -136,7 +139,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 **Longer-term / strategic**
 
 - **Fork strategy:** settled as a hard fork (personal use). Upstream or eliminate each forked dependency over time.
-- Re-evaluate the embedded Deno runtime against a lighter sandbox (e.g. WASM) if macro security proves hard to bound. Weigh this against the cost of the Deno upgrade in Phase 3: dropping or replacing Deno would also remove the `vendor/v8` patch and the `serde` cap.
+- Re-evaluate the embedded Deno runtime against a lighter sandbox (e.g. WASM) if macro security proves hard to bound. The Deno upgrade (done) removed the `vendor/v8` patch and the `serde` cap, so the remaining cost of Deno is its periodic, exactly-pinned upgrades.
 
 > [!NOTE]
 > See also the *Kubernetes Instance Backend Feasibility* note (in the personal notes vault, not in this repository). It is a code-grounded look at running each instance as a Kubernetes pod, and is the strictly larger version of the "finish the Docker instance integration" item above. Both need the same `ServerBackend`/`ConsoleTransport` extraction. That work is currently **shelved**.
@@ -146,7 +149,7 @@ The goal is a fork that is **safe to keep running and cheap to keep current**, n
 Nothing is on fire *right now*, as long as the instance isn't exposed to the internet and you don't run untrusted macros. **Three things are genuinely urgent:**
 
 - the unauthenticated monitor and playit.gg endpoints (S3/S7);
-- the `allow_all` macro sandbox (S1);
+- the macro sandbox (S1; fs is now scoped, network and cross-instance ops are not);
 - the dependency tree (S4), whose remaining advisories are mostly blocked on the Deno upgrade.
 
 The codebase is well-structured enough to be worth maintaining. The limiting factor is the **absence of tests** (A1), which is why Phase 2 must come before any serious upgrade work.
@@ -157,29 +160,15 @@ The codebase is well-structured enough to be worth maintaining. The limiting fac
 
 ## 7. Toolchain and dependency audit
 
-### 7.1 Toolchain — unblocked by patching `v8`
+### 7.1 Toolchain and the Deno stack
 
-Verified with `cargo +<ver> check -p lodestone_core --locked --keep-going` (latest run 2026-09-24):
+**Current (2026-09-24):** Rust 1.96.0, `deno_core 0.412.0` (v8 150.4.0), `deno_ast 0.53.3`, no local patches. v8 150 handles the 128-bit `TypeId` itself, so `vendor/v8` and the `[patch.crates-io]` entry are deleted, and `serde` is free to move (now 1.0.229, `time` 0.3.55). The upgrade is described in `docs/deno-upgrade-scoping.md`.
 
-| Toolchain | Result | Blocker(s) |
-|-----------|--------|-----------|
-| 1.70.0 (old pin) | ✅ builds | — |
-| 1.93 / 1.96.0, unpatched | ❌ fails | `v8 0.73` — `E0080: assertion failed: size_of::<TypeId>() == size_of::<u64>()` **and** `time 0.3.20` — `E0282` |
-| **1.96.0 (current pin)**, patched | ✅ builds, tests pass | — (121/124 tests pass; the 3 failures are PaperMC's live API changing shape, unrelated) |
-| 1.98.1, patched | ✅ `cargo check` | not pinned: not installed via rustup here |
-
-> [!IMPORTANT]
-> Earlier versions of this note said moving off 1.70 required the Deno upgrade. **It does not.** The only `v8` breakage is one compile-time assertion in `TypeIdHasher` (`src/isolate.rs`), since `TypeId` became 128-bit in Rust 1.72. The fix (2026-09-24):
->
-> - `vendor/v8/` holds the published `v8 0.73.0` crate (`Cargo.toml`, `build.rs`, `src/`, `tools/download_file.py`), wired in with `[patch.crates-io]` in the root `Cargo.toml`. `TypeIdHasher` now folds any `write`/`write_u64` input instead of assuming exactly one 64-bit write; the size assertion is removed. It still links the same prebuilt `librusty_v8` 0.73.0 binary.
-> - `time 0.3.20 → 0.3.44` fixes the `E0282` inference error on rustc ≥ 1.80.
-> - Macro tests (`macro_executor::tests`, which execute JS in V8) pass on 1.96.0.
-
-New wall: the old `swc_common` (via `deno_ast`) breaks on `serde 1.0.229` (`unresolved import serde::__private`), so `serde` is held at **1.0.193**, which caps `time` at 0.3.44 (0.3.46+ needs the newer serde). See `CLAUDE.md`.
+History, for reference: the old stack (`deno_core 0.190` / `deno_runtime 0.116` / `v8 0.73`) only built on rustc ≥ 1.72 with a one-function patch to `v8 0.73`'s `TypeIdHasher` (the crate asserted `size_of::<TypeId>() == size_of::<u64>()`, `E0080`), vendored as `vendor/v8`. Its old `swc_common` broke on `serde 1.0.229` (`serde::__private`), which held `serde` at 1.0.193 and `time` at 0.3.44.
 
 ### 7.2 Rust dependencies — `cargo audit` (2026-09-24)
 
-`cargo-audit 0.22.2` against the whole workspace `Cargo.lock`: **25 vulnerabilities, 22 unmaintained, 13 unsound.** The *Path* column comes from `cargo tree -p lodestone_core -i <crate>`. Being in the tree does not by itself mean the vulnerable code is reachable.
+`cargo-audit 0.22.2` against the whole workspace `Cargo.lock`: **25 vulnerabilities, 22 unmaintained, 13 unsound.** *Update after the Deno upgrade (2026-09-24): `cargo audit` was not re-run (not installed in that environment); the struck-through rows were checked with `cargo tree -p lodestone_core` only. `tokio` is now 1.53.1 and `anyhow` 1.0.104, which also clears those two "unsound" entries below.* The *Path* column comes from `cargo tree -p lodestone_core -i <crate>`. Being in the tree does not by itself mean the vulnerable code is reachable.
 
 **Fixed since the first audit (2026-05-29):** openssl (0.10.45 → 0.10.75; 7 advisories), bytes, mio, tar, whoami, plus the h2 advisories that were known at the time. Separately, the `bollard = "*"` wildcard is gone.
 
@@ -187,21 +176,21 @@ New wall: the old `swc_common` (via `deno_ast`) breaks on `serde 1.0.229` (`unre
 
 | Crate | Ver | Advisory | Issue | Fixed in | Path / blocker |
 |-------|-----|----------|-------|----------|----------------|
-| **rsa** | 0.7.2 | RUSTSEC-2023-0071 | Marvin Attack (timing key recovery) | **no fix** | `deno_crypto` — only reachable from macro WebCrypto. *(The first audit wrongly attributed this to sqlx.)* |
-| aes-gcm | 0.10.1 | RUSTSEC-2023-0096 | Plaintext exposed on tag-verification failure | ≥ 0.10.3 | `deno_crypto` → Deno upgrade |
-| ring | 0.16.20 | RUSTSEC-2025-0009 | AES panic with overflow checks | ≥ 0.17.12 | `deno_crypto`, rustls 0.20 |
-| curve25519-dalek | 2.1.3, 3.2.0 | RUSTSEC-2024-0344 | Timing variability | ≥ 4.1.3 | `deno_crypto` / `x25519-dalek` |
-| rustls | 0.20.8, 0.21.1 | RUSTSEC-2024-0336 | Infinite loop on network input | ≥ 0.21.11 | 0.20: `axum-server`, `playit-agent` v0.9, sqlx fork; 0.21: `deno_tls` |
+| ~~rsa~~ | 0.7.2 | RUSTSEC-2023-0071 | Marvin Attack (timing key recovery) | **no fix** | ✅ gone from core's tree with `deno_crypto` (Deno upgrade, 2026-09-24) |
+| ~~aes-gcm~~ | 0.10.1 | RUSTSEC-2023-0096 | Plaintext exposed on tag-verification failure | ≥ 0.10.3 | ✅ gone with `deno_crypto` |
+| ring | 0.16.20 | RUSTSEC-2025-0009 | AES panic with overflow checks | ≥ 0.17.12 | `jsonwebtoken` 8, rustls 0.20 (no longer `deno_crypto`) |
+| ~~curve25519-dalek~~ | 2.1.3, 3.2.0 | RUSTSEC-2024-0344 | Timing variability | ≥ 4.1.3 | ✅ gone with `deno_crypto` |
+| rustls | 0.20.8, 0.21.1 | RUSTSEC-2024-0336 | Infinite loop on network input | ≥ 0.21.11 | 0.20: `axum-server`, `playit-agent` v0.9, sqlx fork; 0.21: `playit-agent` master (`deno_tls` is now on rustls 0.23) |
 | rustls-webpki | 0.100.1 | RUSTSEC-2023-0053, 2026-0098/0099/0104 | CPU DoS; name-constraint bypasses; CRL panic | ≥ 0.101.4 / 0.103.12 | via rustls |
 | webpki | 0.22.0 | RUSTSEC-2023-0052 | CPU DoS in path building | ≥ 0.22.2 | via rustls 0.20 |
 | tungstenite | 0.18.0 | RUSTSEC-2023-0065 | Remote DoS | ≥ 0.20.1 | `axum 0.6` → axum upgrade |
 | h2 | 0.3.27 | RUSTSEC-2026-0258 | Unbounded empty DATA frames | ≥ 0.4.16 | hyper 0.14 → axum upgrade |
-| time | 0.3.44 | RUSTSEC-2026-0009 | DoS via stack exhaustion | ≥ 0.3.47 | needs newer `serde`, which breaks old `swc_common` → Deno upgrade |
+| ~~time~~ | 0.3.44 | RUSTSEC-2026-0009 | DoS via stack exhaustion | ≥ 0.3.47 | ✅ now 0.3.55 (Deno upgrade lifted the `serde` cap) |
 | time | 0.1.45 | RUSTSEC-2020-0071 | Potential segfault (`localtime_r`) | ≥ 0.2.23 | `chrono 0.4.22` (direct), `playit-agent` |
 | tracing-subscriber | 0.3.16 | RUSTSEC-2025-0055 | ANSI-escape log injection | ≥ 0.3.20 | **quick win** (0.3.20 declares MSRV 1.65) |
 | remove_dir_all | 0.5.3 | RUSTSEC-2023-0018 | TOCTOU link-following race | ≥ 0.8.0 | only via `tempdir` → **quick win** (§7.4) |
 | crossbeam-epoch | 0.9.14 | RUSTSEC-2026-0204 | Invalid pointer deref in `fmt::Pointer` | ≥ 0.9.20 | `rayon` → **quick win** (0.9.20 declares MSRV 1.61) |
-| idna | 0.2.3, 0.3.0 | RUSTSEC-2024-0421 | Punycode label confusion | ≥ 1.0.0 | old `url` versions → dependency modernization |
+| ~~idna~~ | 0.2.3, 0.3.0 | RUSTSEC-2024-0421 | Punycode label confusion | ≥ 1.0.0 | ✅ core's tree now has only `idna 1.1.0` (after the Deno upgrade) |
 
 #### Desktop (Tauri) only
 
@@ -221,7 +210,7 @@ The runtime-relevant direct dependencies to look at first are **`axios`** (criti
 
 ### 7.4 Remaining quick wins
 
-Each item has to be verified with `cargo check` / `cargo test` after the bump, and `Cargo.lock` must still have `serde 1.0.193` (§7.1). With the toolchain at 1.96, MSRV is no longer the constraint; `openssl` can also move past 0.10.75 now.
+Each item has to be verified with `cargo check` / `cargo test` after the bump, and the exactly pinned `deno_*` crates must not move (§7.1). With the toolchain at 1.96, MSRV is no longer the constraint; `openssl` can also move past 0.10.75 now.
 
 1. `cargo update -p tracing-subscriber --precise 0.3.20` (or the newest version that still builds): clears RUSTSEC-2025-0055.
 2. Replace the test-only `tempdir::TempDir::new(..)` calls (`util.rs`, `global_settings.rs`, `auth/user.rs`) with `tempfile::tempdir()`. `tempfile` is already a dependency. Then drop `tempdir`, which removes `remove_dir_all 0.5.3` along with it.
@@ -230,7 +219,7 @@ Each item has to be verified with `cargo check` / `cargo test` after the bump, a
 5. Replace `ansi_term` (two call sites in `lib.rs`) with a maintained crate or plain ANSI codes.
 6. Dashboard: bump `axios` and `jsonwebtoken` within their current majors where possible.
 
-Beyond this list, the remaining advisories are gated on three larger projects: the **Deno stack** (`serde`/`time`, `deno_crypto` chain), the **axum 0.7 migration** (h2, tungstenite, rustls 0.20 via axum-server) and **retiring the sqlx fork**.
+Beyond this list, the remaining advisories are gated on two larger projects: the **axum 0.7 migration** (h2, tungstenite, rustls 0.20 via axum-server) and **retiring the sqlx fork**. (The third, the **Deno stack**, is done; it cleared `time` and the `deno_crypto` chain.)
 
 ---
 
@@ -238,7 +227,7 @@ Beyond this list, the remaining advisories are gated on three larger projects: t
 
 | Area | File:line |
 |------|-----------|
-| Deno sandbox `allow_all` | `core/src/macro_executor.rs:350-352` |
+| Macro permissions (was `allow_all`) | `core/src/macro_executor/permissions.rs`; what `Deno` exposes: `core/src/macro_executor/bootstrap.js` (`DENO_API`) |
 | Global FS raw path | `core/src/handlers/global_fs.rs` (124, 163, 200, 236, 311, 346, 382, 417) |
 | Unauthenticated monitor WS | `core/src/handlers/monitor.rs:23`, route `:86` |
 | Unauthenticated playit.gg | routes `core/src/handlers/playitgg.rs:11-18`, handlers `core/src/playitgg/mod.rs` |
